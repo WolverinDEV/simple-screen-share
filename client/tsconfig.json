@@ -1,0 +1,17 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "module": "CommonJS",
+        "moduleResolution": "Node",
+        "esModuleInterop": true,
+        "jsx": "react",
+
+        "baseUrl": ".",
+        "paths": {
+            "@sss-definitions/*": [ "generated/*" ]
+        }
+    },
+    "exclude": [
+        "node_modules"
+    ]
+}
