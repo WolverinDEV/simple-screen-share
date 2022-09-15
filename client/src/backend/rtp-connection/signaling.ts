@@ -1,7 +1,9 @@
 import { C2SMessage, C2SRequest, IceCandidate, S2CMessage, S2CNotify, S2CResponse } from "@sss-definitions/rtp-messages";
+import { RtpEvents } from ".";
+import { EventEmitter } from "../../utils/ee2";
 import { Observable } from "../../utils/observable";
 import { VirtualCamera } from "../../utils/virtual-camera";
-import { RtcConnection, RtpSignalingConnection } from "./rtc";
+import { RemoteStream, RtcConnection, RtpSignalingConnection } from "./rtc";
 
 type ConnectionState = {
     status: "unconnected",
@@ -31,6 +33,7 @@ type NotifyHandler = {
 const kRequestErrorConnectionClosed: S2CResponse = { type: "ConnectionClosed" };
 const kRequestErrorRequestTimeout: S2CResponse = { type: "RequestTimeout" };
 export class RtpServerConnection {
+    readonly events: EventEmitter<RtpEvents>;
     private readonly serverUrl: string;
     private readonly connectToken: string;
     private readonly rtcConnection: RtcConnection;
@@ -44,6 +47,8 @@ export class RtpServerConnection {
     private sessionInitialized: boolean;
 
     constructor(serverUrl: string, connectToken: string) {
+        this.events = new EventEmitter();
+
         this.serverUrl = serverUrl;
         this.connectToken = connectToken;
 
@@ -53,13 +58,19 @@ export class RtpServerConnection {
         this.requests = {};
         this.notify = {};
 
-        this.rtcConnection = new RtcConnection();
+        this.rtcConnection = new RtcConnection(this.events);
 
         this.notify["NotifyIceCandidate"] = candidate => this.rtcConnection.applyRemoteIceCandidate(candidate);
         this.notify["NotifyIceCandidateFinished"] = () => this.rtcConnection.applyRemoteIceCandidate(null);
         this.notify["NotifyNegotiationOffer"] = async offer => {
             const answer = await this.rtcConnection.applyNegotiationOffer(offer);
             this.sendRequest("NegotiationAnswer", { answer });  
+        };
+
+        this.notify["NotifyUsers"] = users => console.info("Users: %o", users);
+        this.notify["NotifyBroadcastStarted"] = broadcast => {
+            console.info("Broadcast started: %o", broadcast);
+            this.sendRequest("BroadcastSubscribe", { broadcast_id: broadcast.broadcast_id });
         };
     }
 
@@ -172,21 +183,28 @@ export class RtpServerConnection {
                 console.warn("Invalid initialize session result: %o", result);
                 return;
             }
-
-            this.state.value = { status: "connected" };
             
             this.initializeRtcSignalingConnection();
             await this.rtcConnection.applyNegotiationAnswer(result.payload.answer);
             console.log("Applied remote description.");
 
             this.sessionInitialized = true;
+            this.state.value = { status: "connected" };
             {
                 const vcam = new VirtualCamera(30, { width: 1080, height: 1080, });
                 vcam.start();
 
                 const streamId = await this.rtcConnection.sendTrack(vcam.getMediaStream().getVideoTracks()[0]);
                 console.log("Starting VCam at %s", streamId);
-                this.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId });
+                await this.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId });
+
+                // await new Promise(resolve => setTimeout(resolve, 1000));
+                // console.log("Starting VCam at %s", streamId);
+                // await this.sendRequest("BroadcastStart", { name: "V-Cam 2", source: streamId });
+
+                // await new Promise(resolve => setTimeout(resolve, 1000));
+                // console.log("Starting VCam at %s", streamId);
+                // await this.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId });
             }
         });
     }
@@ -250,5 +268,14 @@ export class RtpServerConnection {
                 handler(message.payload.payload, message.payload.type);
                 break; 
         }
+    }
+    
+    public getRemoteStreams() : RemoteStream[] {
+        return this.rtcConnection.getRemoteStreams();
+    }
+
+    public getRemoteStream(streamId: string) : RemoteStream | null {
+        return this.rtcConnection.getRemoteStreams()
+            .find(stream => stream.streamId === streamId) ?? null;
     }
 }

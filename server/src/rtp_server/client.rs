@@ -135,11 +135,9 @@ impl SignalingClient {
 
             if let Some(client) = weak_client.upgrade() {
                 let client = client.lock().await;
-                client.subscriber.iter().cloned().for_each(|s| {
-                    tokio::spawn(async move {
-                        s.connected().await;
-                    });
-                });
+                client.subscriber
+                    .iter()
+                    .for_each(|s| s.connected());
             }
         });
 
@@ -294,11 +292,9 @@ impl SignalingClient {
             _ => panic!(),
         }
 
-        self.subscriber.iter().cloned().for_each(|s| {
-            tokio::spawn(async move {
-                s.connection_closing().await;
-            });
-        });
+        self.subscriber
+            .iter()
+            .for_each(|s| s.connection_closing());
     }
 
     /// Close the client connection.
@@ -312,24 +308,20 @@ impl SignalingClient {
             } => {
                 let _ = shutdown_read.send(());
                 let _ = shutdown_write.send(());
-                self.subscriber.iter().cloned().for_each(|s| {
-                    tokio::spawn(async move {
-                        s.connection_closing().await;
-                    });
-                });
-                self.subscriber.iter().cloned().for_each(|s| {
-                    tokio::spawn(async move {
-                        s.connection_closed().await;
-                    });
-                });
+                
+                self.subscriber
+                    .iter()
+                    .for_each(|s| s.connection_closing());
+                    
+                self.subscriber
+                    .iter()
+                    .for_each(|s| s.connection_closed());
             }
             ClientConnection::Disconnecting { shutdown_write, .. } => {
                 let _ = shutdown_write.send(());
-                self.subscriber.iter().cloned().for_each(|s| {
-                    tokio::spawn(async move {
-                        s.connection_closed().await;
-                    });
-                });
+                self.subscriber
+                    .iter()
+                    .for_each(|s| s.connection_closed());
             }
             _ => return,
         }
@@ -354,14 +346,11 @@ impl SignalingClient {
     }
 }
 
-/// All callbacks will be called in a seperate thread.
-/// It will not be waited for completion.
-#[async_trait]
 pub trait ConnectedClientSubscriber: Sync + Send {
     /// Note: This might never be called since the client can already be connected when the subscriber gets registered.
-    async fn connected(&self) {}
-    async fn connection_closing(&self) {}
-    async fn connection_closed(&self) {}
+    fn connected(&self) {}
+    fn connection_closing(&self) {}
+    fn connection_closed(&self) {}
 }
 
 #[async_trait]

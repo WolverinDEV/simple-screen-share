@@ -84,6 +84,8 @@ async fn main() {
         .await
         .expect("failed to create REST server");
 
+    console_subscriber::init();
+
     let shutdown_handle = rocket.shutdown();
     task::spawn(async {
         info!("Press ctrl-c to terminate server");

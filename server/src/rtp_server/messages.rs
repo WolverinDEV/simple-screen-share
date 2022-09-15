@@ -160,10 +160,12 @@ pub mod response {
 }
 
 pub mod notify {
+    use std::collections::BTreeMap;
+
     use serde::Serialize;
     use typescript_type_def::TypeDef;
 
-    use crate::{rest_controller::auth::UserId, rtp_server::client::ClientId};
+    use crate::{rest_controller::auth::UserId, rtp_server::{client::ClientId, room::BroadcastId}};
 
     use super::IceCandidate;
 
@@ -176,13 +178,29 @@ pub mod notify {
 
         /// Will be send when joining a room.
         /// Contains all clients.
-        NotifyUsers(Vec<(ClientId, UserId)>),
+        NotifyUsers(Vec<NotifyUserEntry>),
 
         /// Will be send when a new user joins the room.
         NotifyUserJoined(ClientId, UserId),
 
         /// Will be send when a user leaves the room.
         NotifyUserLeft(ClientId),
+
+        NotifyBroadcastStarted {
+            client_id: ClientId,
+            broadcast_id: BroadcastId,
+            name: String,
+        },
+
+        NotifyBroadcastEnded(BroadcastId),
+    }
+
+    #[derive(Debug, Serialize, TypeDef)]
+    pub struct NotifyUserEntry {
+        pub client_id: ClientId,
+        pub user_id: UserId,
+
+        pub broadcasts: BTreeMap<BroadcastId, String>,
     }
 }
 #[derive(Debug, Serialize, TypeDef)]

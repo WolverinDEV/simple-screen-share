@@ -12,6 +12,7 @@
     "@types/react-helmet": "^6.1.5",
     "axios": "^0.27.2",
     "babel-loader": "^8.2.5",
+    "eventemitter2": "^6.4.9",
     "helmet": "^5.1.1",
     "object-assign": "^4.1.1",
     "react": "^18.2.0",

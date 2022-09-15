@@ -1,17 +1,18 @@
 use log::{debug, error, info, trace, warn};
+use rand::{thread_rng, distributions::Alphanumeric, Rng};
 use rocket::{
     async_trait,
     tokio::{
         self, select,
-        sync::{mpsc, oneshot, Mutex},
+        sync::{mpsc, Mutex, oneshot},
         task,
     },
 };
 use std::{
     collections::VecDeque,
-    ops::DerefMut,
+    ops::{DerefMut, Deref},
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, atomic::{AtomicBool}},
     task::{Context, Poll},
 };
 use tokio_stream::Stream;
@@ -32,11 +33,11 @@ use webrtc::{
         RTCPeerConnection,
     },
     rtcp::{
-        payload_feedbacks::picture_loss_indication::PictureLossIndication,
+        payload_feedbacks::{picture_loss_indication::PictureLossIndication, receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate},
         receiver_report::ReceiverReport,
         transport_feedbacks::{
             transport_layer_cc::TransportLayerCc, transport_layer_nack::TransportLayerNack,
-        },
+        }, sender_report::SenderReport, source_description::SourceDescription,
     },
     rtp_transceiver::{
         rtp_codec::{
@@ -44,7 +45,7 @@ use webrtc::{
             RTPCodecType,
         },
         rtp_receiver::RTCRtpReceiver,
-        PayloadType, SSRC,
+        PayloadType, SSRC, rtp_sender::RTCRtpSender,
     },
     track::{
         track_local::{TrackLocal, TrackLocalContext, TrackLocalWriter},
@@ -61,9 +62,13 @@ use super::{
 };
 
 struct RtpClientTrackSource {
+    weak_track: Weak<RegisteredReceivingTrack>,
+
     ssrc: SSRC,
     events: mpsc::Receiver<RtpSourceEvent>,
     rtcp_sender: RtcpSender,
+
+    recv_handler: Arc<RtpSourceHandler>,
 }
 
 impl RtpSource for RtpClientTrackSource {
@@ -89,24 +94,71 @@ impl Stream for RtpClientTrackSource {
     }
 }
 
-struct RtpClientTrackHandler {
+impl Drop for RtpClientTrackSource {
+    fn drop(&mut self) {
+        if let Some(track) = self.weak_track.upgrade() {
+            // Remove the handler from the track.
+            let handler = self.recv_handler.clone() as Arc<dyn ReceivingTrackHandler>;
+            track.remove_handler(&handler);
+        }
+    }
+}
+
+struct RtpSourceHandler {
     events: mpsc::Sender<RtpSourceEvent>,
 }
 
-impl RtpClientTrackHandler {
-    async fn handle_rtp_packet(&mut self, packet: webrtc::rtp::packet::Packet) {
+#[async_trait]
+impl ReceivingTrackHandler for RtpSourceHandler {
+    async fn handle_rtp_packet(&self, packet: webrtc::rtp::packet::Packet) {
         let _ = self.events.send(RtpSourceEvent::Media(packet)).await;
     }
 
-    async fn handle_rtcp_packet(
-        &mut self,
-        packet: Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>,
-    ) {
-        trace!("Having RTCP {}.", packet.header().packet_type.to_string());
+    async fn handle_rtcp_packet(&self, packet: Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>) {
+        if let Some(_sr) = packet.as_any().downcast_ref::<SenderReport>() {
+
+        } else if let Some(_sd) = packet.as_any().downcast_ref::<SourceDescription>() {
+
+        } else {
+            trace!("Having RTCP {:#}.", packet);
+        }
+    }
+
+    async fn handle_rtp_error(&self, _error: &webrtc::Error) -> bool { false }
+    async fn handle_rtcp_error(&self, _error: &webrtc::Error) -> bool { false }
+
+
+    async fn handle_unmount(&self) {
+        let _ = self.events.send(RtpSourceEvent::End).await;
+    }
+
+    async fn handle_closed(&self) {
+        let _ = self.events.send(RtpSourceEvent::End).await;
     }
 }
 
-struct ReceivingTrack {
+/// Receiving track handler.
+/// Note: Callback methods are blocking the handle method.
+#[async_trait]
+trait ReceivingTrackHandler: Send + Sync {
+    async fn handle_rtp_packet(&self, packet: webrtc::rtp::packet::Packet);
+    async fn handle_rtcp_packet(&self, packet: Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>);
+
+    /// Handle a rtp read error.
+    /// If returned `true` the error will be consumed and not default handled
+    /// which most likely will cause the connection to close.
+    async fn handle_rtp_error(&self, error: &webrtc::Error) -> bool;
+
+    /// Handle a rtcp read error.
+    /// If returned `true` the error will be consumed and not default handled
+    /// which most likely will cause the connection to close.
+    async fn handle_rtcp_error(&self, error: &webrtc::Error) -> bool;
+
+    async fn handle_unmount(&self);
+    async fn handle_closed(&self);
+}
+
+struct RegisteredReceivingTrack {
     stream_id: String,
     weak_client: Weak<Mutex<RtpClient>>,
 
@@ -114,157 +166,135 @@ struct ReceivingTrack {
     receiver: Arc<RTCRtpReceiver>,
     rtcp_sender: RtcpSender,
 
-    unmount_sender: Option<oneshot::Sender<()>>,
+    closed: Arc<AtomicBool>,
+    handler: parking_lot::Mutex<Option<Arc<dyn ReceivingTrackHandler>>>,
 }
 
-impl ReceivingTrack {
-    /// Accquire the track and hold it as loong the we don't receive an unmount
-    /// notification or we drop the receiver.
-    fn accquire(&mut self) -> oneshot::Receiver<()> {
-        let (mut recv_tx, recv_rx) = oneshot::channel();
-        let (unmount_tx, mut unmount_rx) = oneshot::channel();
+impl RegisteredReceivingTrack {
+    fn get_handler(&self) -> Option<Arc<dyn ReceivingTrackHandler>> {
+        let handler = self.handler.lock();
+        handler.as_ref().cloned()
+    }
+}
 
-        /* Stop the last source from reading of this source. */
-        if let Some(sender) = self.unmount_sender.replace(unmount_tx) {
-            let _ = sender.send(());
+fn webrtc_error_is_disconnect(error: &webrtc::Error) -> bool {
+    use webrtc::Error;
+
+
+    let text = error.to_string();
+    if text.ends_with("buffer: closed") {
+        trace!("Buffer-Error: {:#?}", error);
+        return true;
+    }
+    error == &Error::ErrDataChannelNotOpen || error == &Error::ErrClosedPipe
+}
+
+async fn registered_receive_track_io_loop(receiving_track: Arc<RegisteredReceivingTrack>) {
+    loop {
+        select! {
+            rtp = receiving_track.track.read_rtp() => {
+                let (rtp, _attributes) = match rtp {
+                    Err(error) => {
+                        if let Some(handler) = receiving_track.get_handler() {
+                            if handler.handle_rtp_error(&error).await {
+                                // Error handled, we can continue.
+                                continue;
+                            }
+                        }
+
+                        if !webrtc_error_is_disconnect(&error) {
+                            error!("RTP read error: {:#?}. Track {} closed.", error, receiving_track.stream_id);
+                            /* TODO: Improve handling */
+                        } else {
+                            // TODO: Figure out why sometimes we get an Srtp Util ErrBufferClosed here.
+                            trace!("Receiving track {} closed (rtp disconnect error).", receiving_track.stream_id);
+                        }
+                        break;
+                    },
+                    Ok(payload) => payload
+                };
+
+                if let Some(handler) = receiving_track.get_handler() {
+                    handler.handle_rtp_packet(rtp).await;
+                }
+            },
+            rtcp = receiving_track.receiver.read_rtcp() => {
+                let (rtcps, _attributes) = match rtcp {
+                    Err(error) => {
+                        if let Some(handler) = receiving_track.get_handler() {
+                            if handler.handle_rtcp_error(&error).await {
+                                // Error handled, we can continue.
+                                continue;
+                            }
+                        }
+
+                        if !webrtc_error_is_disconnect(&error) {
+                            error!("RTCP read error: {:#?}. Track {} closed.", error, receiving_track.stream_id);
+                            /* TODO: Improve handling */
+                        } else {
+                            trace!("Receiving track {} closed (rtcp disconnect error).", receiving_track.stream_id);
+                        }
+                        break;
+                    },
+                    Ok(rtcp) => rtcp
+                };
+                
+                for rtcp in rtcps {
+                    if let Some(handler) = receiving_track.get_handler() {
+                        handler.handle_rtcp_packet(rtcp).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl RegisteredReceivingTrack {
+    /// Update the handler for this track.
+    /// If not handler is specified, all data will be voided. 
+    fn update_handler(&self, new_handler: Option<Arc<dyn ReceivingTrackHandler>>) {
+        let mut handler = self.handler.lock();
+        if let Some(old_handler) = handler.take() {
+            tokio::task::spawn(async move {
+                old_handler.handle_unmount().await;
+            });
         }
 
-        let track = self.track.clone();
-        let weak_client = self.weak_client.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = recv_tx.closed() => {
-                    /*
-                     * The unmount handle has been dropped.
-                     * Redirect this track to void.
-                     */
-                    if let Some(client) = weak_client.upgrade() {
-                        let mut client = client.lock().await;
-                        client.handle_track_recv_dropped(&track).await;
-                    }
-                },
-                _ = &mut unmount_rx => {
-                    /*
-                     * We requested an unmount.
-                     * Forward this to the receiver and abort this drop watcher.
-                     */
-                    let _ = recv_tx.send(());
-                }
-            }
-        });
-
-        recv_rx
+        *handler = new_handler;
     }
-
-    fn create_rtp_source(&mut self) -> Pin<Box<dyn RtpSource>> {
-        let mut unmount_rx = self.accquire();
-
-        let track = self.track.clone();
-        let receiver = self.receiver.clone();
-
-        let (tx, rx) = mpsc::channel(8);
-        let mut handler = RtpClientTrackHandler { events: tx };
-        task::spawn(async move {
-            loop {
-                select! {
-                    _ = handler.events.closed() => {
-                        /* receiver disconnected */
-                        break;
-                    },
-                    _ = &mut unmount_rx => {
-                        /* stream ended. */
-                        break;
-                    },
-                    rtp = track.read_rtp() => {
-                        let (rtp, _attributes) = match rtp {
-                            Err(_error) => {
-                                /* FIXME: Error handling! */
-                                continue;
-                            },
-                            Ok(payload) => payload
-                        };
-
-                        handler.handle_rtp_packet(rtp).await;
-                    },
-                    rtcp = receiver.read_rtcp() => {
-                        let (rtcps, _attributes) = match rtcp {
-                            Err(_error) => {
-                                /* FIXME: Error handling! */
-                                continue;
-                            },
-                            Ok(rtcp) => rtcp
-                        };
-
-                        for rtcp in rtcps {
-                            handler.handle_rtcp_packet(rtcp).await;
-                        }
-                    }
-                }
+    
+    fn remove_handler(&self, handler: &Arc<dyn ReceivingTrackHandler>) {
+        let mut current_handler = self.handler.lock();
+        let handler_equal = current_handler
+            .as_ref()
+            .map(|h| Arc::ptr_eq(h, handler))
+            .unwrap_or(false);
+            
+        if handler_equal {
+            if let Some(old_handler) = current_handler.take() {
+                tokio::task::spawn(async move {
+                    old_handler.handle_unmount().await;
+                });
             }
-        });
-
-        Box::pin(RtpClientTrackSource {
-            events: rx,
-            ssrc: self.track.ssrc(),
-            rtcp_sender: self.rtcp_sender.clone(),
-        })
+        }
     }
+}
 
-    // Consume everything and do nothing about this track.
-    fn accquire_void(&mut self) {
-        let mut unmount_rx = self.accquire();
-
-        let track = self.track.clone();
-        let receiver = self.receiver.clone();
-        task::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut unmount_rx => {
-                        // No more receiving...
-                        trace!("Voice receiver stop!");
-                        return;
-                    },
-                    read = track.read_rtp() => {
-                        if let Err(error) = read {
-                            warn!("Void receiver encountered error: {:#}", error);
-                            // TODO: Handle error and may invalidate track or whatever?
-                        }
-                    },
-                    read = receiver.read_rtcp() => {
-                        if let Err(error) = read {
-                            warn!("Void receiver encountered rtcp error: {:#}", error);
-                            // TODO: Handle error and may invalidate track or whatever?
-                        }
-                    }
-                };
-            }
-        });
+impl Drop for RegisteredReceivingTrack {
+    fn drop(&mut self) {
+        trace!("Dropping ReceivingTrack {}", self.stream_id);
     }
 }
 
 struct RtpClientTarget {
     weak_client: Weak<Mutex<RtpClient>>,
-    track: Arc<SendingTrack>,
+    track: Arc<RegisteredSendingTrack>,
     events: mpsc::Receiver<RtpTargetEvent>,
 }
 
 impl RtpTarget for RtpClientTarget {
     fn send_rtp(&self, packet: &mut webrtc::rtp::packet::Packet) {
-        let track = self.track.clone();
-
-        let mut packet = packet.clone();
-        tokio::spawn(async move {
-            let mut binding = track.binding.lock().await;
-
-            let stream = match binding.deref_mut() {
-                Some(stream) => stream,
-                None => return,
-            };
-
-            packet.header.ssrc = stream.ssrc;
-            packet.header.payload_type = stream.payload_type;
-            let _ = stream.write_stream.write_rtp(&packet).await;
-        });
+        let _ = self.track.rtp_send_channel.try_send(packet.clone());
     }
 }
 
@@ -276,6 +306,12 @@ impl Stream for RtpClientTarget {
     }
 }
 
+impl Drop for RtpClientTarget {
+    fn drop(&mut self) {
+        // TODO: Remove the handler from the track and allow other clients to use that track
+    }
+}
+
 struct SendingTrackBinding {
     id: String,
     ssrc: SSRC,
@@ -283,13 +319,58 @@ struct SendingTrackBinding {
     write_stream: Arc<dyn TrackLocalWriter + Send + Sync>,
 }
 
-struct SendingTrack {
+struct RegisteredSendingTrack {
     id: String,
     binding: Mutex<Option<SendingTrackBinding>>,
+
+    shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+    event_handler: parking_lot::Mutex<Option<mpsc::Sender<RtpTargetEvent>>>,
+
+    rtp_send_channel: mpsc::Sender<webrtc::rtp::packet::Packet>,
+}
+
+impl RegisteredSendingTrack {
+    fn get_event_handler(&self) -> Option<mpsc::Sender<RtpTargetEvent>> {
+        let handler = self.event_handler.lock();
+        handler.deref().clone()
+    }
+
+    /// Returns true if the error has been consumed
+    /// else false if it aborts the read loop.
+    async fn handle_rtcp_error(&self, _error: &webrtc::Error) -> bool {
+        false
+    }
+
+    async fn handle_rtcp(&self, event: Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>) {
+        if let Some(_) = event.as_any().downcast_ref::<TransportLayerCc>() {
+            //trace!("Received TransportLayerCc");
+        } else if let Some(pli) = event.as_any().downcast_ref::<PictureLossIndication>() {
+            trace!(
+                "Received PLI request from {} for {}.",
+                pli.sender_ssrc,
+                pli.media_ssrc
+            );
+
+            if let Some(handler) = self.get_event_handler() {
+                let _ = handler.send(RtpTargetEvent::RequestPli).await;
+            }
+        } else if let Some(_rr) = event.as_any().downcast_ref::<ReceiverReport>() {
+            // TODO: Get current track id and extract own report.
+            trace!("Received ReceiverReport.");
+        } else if let Some(_nack) = event.as_any().downcast_ref::<TransportLayerNack>() {
+            /* Nack handling itself already done by an interceptor. */
+        } else if let Some(_remb) = event.as_any().downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
+            /* Thanks for the information. We may later want to increase/decrese video quality based on that information. */
+        } else if let Some(_remb) = event.as_any().downcast_ref::<SourceDescription>() {
+            /* TODO: I'm not sure why we get this, needs more investigation. */
+        } else {
+            trace!("RTCP send read rtcp: {:#?}", event);
+        }
+    }
 }
 
 #[async_trait]
-impl TrackLocal for SendingTrack {
+impl TrackLocal for RegisteredSendingTrack {
     async fn bind(&self, ctx: &TrackLocalContext) -> webrtc::error::Result<RTCRtpCodecParameters> {
         let write_stream = ctx
             .write_stream()
@@ -334,6 +415,77 @@ impl TrackLocal for SendingTrack {
     }
 }
 
+async fn registered_send_track_io_loop(track: Arc<RegisteredSendingTrack>, sender: Arc<RTCRtpSender>, mut rtp_rx: mpsc::Receiver<webrtc::rtp::packet::Packet>) {
+    enum LoopEvent {
+        Shutdown,
+        RtpSend(webrtc::rtp::packet::Packet),
+        RtcpReceive(Vec<Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>>),
+        RtcpReceiveError(webrtc::Error),
+
+        Noop,
+    }
+
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    let old_shutdown_tx = {
+        let mut shutdown_tx_handle = track.shutdown_tx.lock();
+        shutdown_tx_handle.replace(shutdown_tx)
+    };
+    if let Some(old_shutdown_tx) = old_shutdown_tx {
+        let _ = old_shutdown_tx.send(());
+    }
+
+    loop {
+        let event = select! {
+            _ = &mut shutdown_rx => {
+                LoopEvent::Shutdown
+            },
+            packet = rtp_rx.recv() => {
+                if let Some(packet) = packet {
+                    LoopEvent::RtpSend(packet)
+                } else {
+                    LoopEvent::Noop
+                }
+            },
+            event = sender.read_rtcp() => {
+                match event {
+                    Err(error) => LoopEvent::RtcpReceiveError(error),
+                    Ok((packets, _attributes)) => LoopEvent::RtcpReceive(packets),
+                }
+            },
+        };
+
+        match event {
+            LoopEvent::Shutdown => break,
+            LoopEvent::RtcpReceive(packets) => {
+                for event in packets {
+                    track.handle_rtcp(event).await;
+                }
+            },
+            LoopEvent::RtcpReceiveError(error) => {
+                if track.handle_rtcp_error(&error).await {
+                    continue
+                }
+
+                if !webrtc_error_is_disconnect(&error) {
+                    warn!("RTP Sender rtcp read error: {:#}. Stopping sender.", error);
+                }
+                break;
+            },
+            LoopEvent::RtpSend(mut packet) => {
+                let binding = track.binding.lock().await;
+                if let Some(binding) = binding.as_ref() {
+                    packet.header.ssrc = binding.ssrc;
+                    packet.header.payload_type = binding.payload_type;
+
+                    let _ = binding.write_stream.write_rtp(&packet).await;
+                }
+            },
+            LoopEvent::Noop => {}
+        }
+    }
+}
+
 type RtcpSender = mpsc::Sender<Vec<Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>>>;
 pub struct RtpClient {
     weak_ref: Weak<Mutex<Self>>,
@@ -341,7 +493,9 @@ pub struct RtpClient {
 
     client_id: ClientId,
     peer: webrtc::peer_connection::RTCPeerConnection,
-    tracks: VecDeque<ReceivingTrack>,
+
+    receiving_tracks: VecDeque<Arc<RegisteredReceivingTrack>>,
+    sending_tracks: VecDeque<Arc<RegisteredSendingTrack>>,
 
     rtcp_channel: RtcpSender,
 }
@@ -463,7 +617,9 @@ impl RtpClient {
 
             client_id,
             peer: Self::create_peer().await?,
-            tracks: Default::default(),
+
+            receiving_tracks: Default::default(),
+            sending_tracks: Default::default(),
 
             rtcp_channel: rtcp_tx,
         }));
@@ -471,7 +627,7 @@ impl RtpClient {
         {
             let mut client = instance.lock().await;
             client.weak_ref = Arc::downgrade(&instance);
-            client.bind_peer_listener().await;
+            client.initialize_peer().await?;
         }
 
         {
@@ -526,14 +682,15 @@ impl RtpClient {
 
     async fn execute_renegotiation(&mut self, force: bool) -> Result<(), webrtc::Error> {
         debug!(
-            "[{}] Nego? {:#?}",
+            "[{}] Nego? {:#?} (force: {})",
             self.client_id,
-            self.peer.signaling_state()
+            self.peer.signaling_state(),
+            force
         );
-        if !force && self.peer.signaling_state() == RTCSignalingState::Stable {
-            // No need to signal anything.
-            return Ok(());
-        }
+        // if !force && self.peer.signaling_state() == RTCSignalingState::Stable {
+        //     // No need to signal anything.
+        //     return Ok(());
+        // }
 
         debug!("[{}] Executing renegotiation.", self.client_id);
         let offer = self.peer.create_offer(None).await?;
@@ -551,7 +708,7 @@ impl RtpClient {
         Ok(())
     }
 
-    async fn bind_peer_listener(&mut self) {
+    async fn initialize_peer(&mut self) -> anyhow::Result<()> {
         self.peer
             .on_peer_connection_state_change(Box::new(move |state| {
                 Box::pin(async move {
@@ -669,46 +826,42 @@ impl RtpClient {
                         track.stream_id().await,
                         track.rid()
                     );
-                    let mut track = ReceivingTrack {
+                    let track = RegisteredReceivingTrack {
                         stream_id,
                         weak_client: weak_ref.clone(),
-                        unmount_sender: None,
+                        
                         receiver,
                         track,
                         rtcp_sender: rtcp_channel.clone(),
+                        closed: Arc::new(AtomicBool::new(false)),
+
+                        handler: Default::default(),
                     };
-                    track.accquire_void();
-                    ref_self.lock().await.tracks.push_back(track);
+                    let track = Arc::new(track);
+                    ref_self.lock().await.receiving_tracks.push_back(track.clone());
+                    
+                    let weak_self = weak_ref.clone();
+                    tokio::spawn(async move {
+                        registered_receive_track_io_loop(track.clone()).await;
+                        if let Some(handler) = track.get_handler() {
+                            handler.handle_closed().await;
+                        }
+
+                        if let Some(_self_ref) = weak_self.upgrade() {
+                            /* TODO: Unregister that track since it has ended. */
+                            trace!("Track {} ended.", track.stream_id);
+                        }
+                    });
                 })
             }))
             .await;
 
-        // let local_track = Arc::new(TrackLocalStaticRTP::new(
-        //     RTCRtpCodecCapability{
-        //         mime_type: MIME_TYPE_VP8.to_owned(),
-        //         ..Default::default()
-        //     },
-        //     "video-01".to_owned(),
-        //     "video-01".to_owned(),
-        // ));
+        // TODO: Proper preallocate alg (the client needs to preallocate as well).
+        // for _ in 0..1 {
+        //     self.create_sending_track().await?;
+        // }
 
-        // let rtp_sender = self.peer
-        //     .add_track(Arc::clone(&local_track) as Arc<dyn TrackLocal + Send + Sync>)
-        //     .await.unwrap();
-
-        // tokio::spawn(async move {
-        //     loop {
-        //         match rtp_sender.read_rtcp().await {
-        //             Ok((rtcp_packet, _attributes)) => {
-        //                 debug!("RTCP packet {:?}", rtcp_packet);
-        //             },
-        //             Err(error) => {
-        //                 warn!("failed to receive rtcp: {}", error);
-        //                 break;
-        //             },
-        //         };
-        //     }
-        // });
+        Ok(())
     }
 
     fn signaling_notify(
@@ -733,93 +886,104 @@ impl RtpClient {
         if let Err(error) = self.peer.close().await {
             warn!("Failed to close peer connection: {}", error);
         }
-    }
-
-    async fn handle_track_recv_dropped(&mut self, track: &Arc<TrackRemote>) {
-        let client_track = self
-            .tracks
-            .iter_mut()
-            .find(|t| Arc::ptr_eq(&t.track, track));
-        let client_track = match client_track {
-            Some(client_track) => client_track,
-            None => return,
-        };
-
-        trace!("Client track dropped. Voiding it!");
-        client_track.accquire_void();
+        trace!("Peer connection closed");
     }
 
     pub fn create_rtc_source(&mut self, stream_id: &str) -> Option<Pin<Box<dyn RtpSource>>> {
-        let stream = self.tracks.iter_mut().find(|t| t.stream_id == stream_id);
+        let stream = self.receiving_tracks.iter_mut().find(|t| t.stream_id == stream_id);
+        let stream = match stream {
+            Some(stream) => stream,
+            None => return None,
+        };
 
-        stream.map(|stream| stream.create_rtp_source())
+        
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let handler = Arc::new(RtpSourceHandler{
+            events: events_tx
+        });
+        let source = Box::pin(RtpClientTrackSource{
+            weak_track: Arc::downgrade(stream),
+            events: events_rx,
+            recv_handler: handler.clone(),
+            rtcp_sender: self.rtcp_channel.clone(),
+            ssrc: stream.track.ssrc()
+        });
+        stream.update_handler(Some(handler));
+        Some(source)
     }
 
-    pub async fn create_rtc_target(&mut self) -> Pin<Box<dyn RtpTarget>> {
-        let track = Arc::new(SendingTrack {
+    async fn create_sending_track(&mut self) -> webrtc::error::Result<Arc<RegisteredSendingTrack>> {
+        let id: String = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+
+        let (rtp_tx, rtp_rx) = mpsc::channel(1024);
+        let track = Arc::new(RegisteredSendingTrack {
             binding: Default::default(),
-            id: "THIS_IS_VIDEO!".to_owned(),
+            id,
+
+            shutdown_tx: Default::default(),
+            event_handler: Default::default(),
+            rtp_send_channel: rtp_tx
         });
 
-        // TODO: Some kind of drop mechanism!
-        let sender = self.peer.add_track(track.clone()).await.unwrap();
-        sender.send(&sender.get_parameters().await).await.unwrap();
+        let sender = self.peer.add_track(track.clone()).await?;
+        {
+            let track = track.clone();
+            let sender = sender.clone();
 
-        let (tx, rx) = mpsc::channel(8);
+            let weak_ref = self.weak_ref.clone();
+            tokio::spawn(async move {
+                registered_send_track_io_loop(track.clone(), sender.clone(), rtp_rx).await;
 
-        tokio::spawn(async move {
-            loop {
-                // TODO: break when tx is closed!
-                let event = sender.read_rtcp().await;
-                let event = match event {
-                    Err(error) => {
-                        warn!("RTCP send read error: {:#}", error);
-                        break;
-                    }
-                    Ok(event) => event,
-                };
-
-                for event in event.0 {
-                    if let Some(_) = event.as_any().downcast_ref::<TransportLayerCc>() {
-                        //trace!("Received TransportLayerCc");
-                    } else if let Some(pli) = event.as_any().downcast_ref::<PictureLossIndication>()
-                    {
-                        trace!(
-                            "Received PLI request from {} for {}.",
-                            pli.sender_ssrc,
-                            pli.media_ssrc
-                        );
-                        let _ = tx.send(RtpTargetEvent::RequestPli).await;
-                    } else if let Some(_rr) = event.as_any().downcast_ref::<ReceiverReport>() {
-                        // TODO: Get current track id and extract own report.
-                        trace!("Received ReceiverReport.");
-                    } else if let Some(nack) = event.as_any().downcast_ref::<TransportLayerNack>() {
-                        /* Nack handling itself already done by an interceptor. */
-                        let lost_packets: u64 =
-                            nack.nacks.iter().map(|n| n.lost_packets as u64).sum();
-                        trace!(
-                            "Received TransportLayerNack. Packets lost: {}",
-                            lost_packets
-                        );
-                    } else {
-                        trace!("RTCP send read rtcp: {:#?}", event);
-                    }
+                // Track finished, remove it from the local track list and from the peer.
+                if let Some(ref_self) = weak_ref.upgrade() {
+                    let ref_self = ref_self.lock().await;
+                    let _ = ref_self.peer.remove_track(&sender).await;
                 }
-            }
 
-            drop(tx);
-        });
+                trace!("Local track {} ended.", track.id());
+            });
+        }
 
         // TODO: Error after 10s if the track never binds.
 
+
+        self.sending_tracks.push_back(track.clone());
+        Ok(track)
+    }
+
+    pub async fn create_rtc_target(&mut self) -> Pin<Box<dyn RtpTarget>> {
+        let track = self.sending_tracks
+            .iter()
+            .find(|track| track.event_handler.lock().is_none())
+            .cloned();
+
+        let track = match track {
+            Some(track) => track,
+            None => {
+                let track = self.create_sending_track().await.unwrap();
+
+                // Sadly currently manually needed...
+                //let _ = self.execute_renegotiation(true).await;
+
+                track
+            }
+        };
+
+        let (events_tx, events_rx) = mpsc::channel(16);
         let target = RtpClientTarget {
-            events: rx,
-            track,
+            events: events_rx,
+            track: track.clone(),
             weak_client: self.weak_ref.clone(),
         };
 
-        // Sadly currently manually needed...
-        let _ = self.execute_renegotiation(true).await;
+        {
+            let mut handler = track.event_handler.lock();
+            *handler = Some(events_tx);
+        }
 
         Box::pin(target)
     }

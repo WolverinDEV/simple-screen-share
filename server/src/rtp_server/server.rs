@@ -10,7 +10,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use rocket::{
     async_trait,
     futures::channel::oneshot,
-    tokio::{net::TcpListener, select, sync::Mutex, task, time},
+    tokio::{net::TcpListener, select, sync::Mutex, task, time, self},
 };
 
 use crate::SERVER_REQUEST_VERSION;
@@ -249,13 +249,12 @@ struct ServerClientSubscriber {
     weak_client: Weak<Mutex<SignalingClient>>,
 }
 
-#[async_trait]
 impl ConnectedClientSubscriber for ServerClientSubscriber {
-    async fn connection_closing(&self) {
+    fn connection_closing(&self) {
         // TODO: Unregister the client from all rooms etc.
     }
 
-    async fn connection_closed(&self) {
+    fn connection_closed(&self) {
         let client = match self.weak_client.upgrade() {
             Some(client) => client,
             None => return,
@@ -265,27 +264,56 @@ impl ConnectedClientSubscriber for ServerClientSubscriber {
             None => return,
         };
 
-        let client_id = client.lock().await.client_id;
-        let address = format!("{}", client.lock().await.address);
+        tokio::spawn(async move {
+            let client_id = client.lock().await.client_id;
+            let address = format!("{}", client.lock().await.address);
 
-        let mut server = server.lock().await;
-        match server.clients.remove(&client_id) {
-            Some(_client) => trace!("Removed client {}.", address),
-            None => warn!("Having client connection closed event of unregistered client."),
-        };
+            let mut server = server.lock().await;
+            match server.clients.remove(&client_id) {
+                Some(_client) => trace!("Removed client {}.", address),
+                None => warn!("Having client connection closed event of unregistered client."),
+            };
 
-        if let Some(room_id) = server.client_rooms.remove(&client_id) {
-            if let Some(room) = server.rooms.get(&room_id) {
-                room.lock().await.remove_client(client_id).await;
+            if let Some(room_id) = server.client_rooms.remove(&client_id) {
+                if let Some(room) = server.rooms.get(&room_id) {
+                    let room = room.clone();
+                    tokio::spawn(async move {
+                        let mut room = room.lock().await;
+                        room.remove_client(client_id).await;
+                    });
+                }
+            }
+
+            if let Some(rtp_client) = server.rtp_clients.remove(&client_id) {
+                // Async since closing might aquire some locks.
+                tokio::spawn(async move {
+                    let mut rtp_client = rtp_client.lock().await;
+                    rtp_client.close().await;
+                });
+            }
+        });
+    }
+}
+
+macro_rules! handler_get_current_room {
+    ($server:expr, $client_id:expr) => {
+        {
+            let room = {
+                let server = $server.lock().await;
+                server
+                    .client_rooms
+                    .get(&$client_id)
+                    .map(|room_id| server.rooms.get(room_id))
+                    .flatten()
+                    .cloned()
+            };
+    
+            match room {
+                Some(room) => room,
+                None => return S2CResponse::SessionNotInitialized,
             }
         }
-
-        if let Some(rtp_client) = server.rtp_clients.remove(&client_id) {
-            let mut rtp_client = rtp_client.lock().await;
-            rtp_client.close().await;
-        }
-        // FIXME: Remove RTP-Client as well!
-    }
+    };
 }
 
 // TODO: Make individual for each client and store the client id as well as a reference (maybe weak?)
@@ -487,24 +515,52 @@ impl ClientRequestHandler for ServerClientHandler {
                     }
                 };
 
-                // FIXME: This is debug!
-                {
-                    let target = {
-                        let mut rtp_client = rtp_client.lock().await;
-                        rtp_client.create_rtc_target().await
-                    };
-
-                    {
-                        let mut room = room.lock().await;
-                        let _ = room
-                            .client_broadcast_subscribe(client_id, broadcast_id, target)
-                            .await;
-                    }
-                }
-
                 return S2CResponse::BroadcastStarted { broadcast_id };
-            }
-            _ => S2CResponse::InvalidRequest,
+            },
+            C2SRequest::BroadcastSubscribe { broadcast_id } => {
+                let room = handler_get_current_room!(server, client_id);
+
+                let rtp_client = match server.lock().await.rtp_clients.get(&client_id).cloned() {
+                    Some(rtp_client) => rtp_client,
+                    None => return S2CResponse::RtpNotInitialized,
+                };
+                
+                let target = {
+                    let mut rtp_client = rtp_client.lock().await;
+                    rtp_client.create_rtc_target().await
+                };
+
+                {
+                    let mut room = room.lock().await;
+
+                    let result = room.client_broadcast_subscribe(client_id, broadcast_id, target).await;
+                    if !matches!(result, S2CResponse::Success) {
+                        return result;
+                    }
+                };
+
+                // TODO: Return the stream id...
+                S2CResponse::Success
+            },
+            C2SRequest::BroadcastUnsubscribe { broadcast_id } => {
+                let room = handler_get_current_room!(server, client_id);
+
+                {
+                    let mut room = room.lock().await;
+                    room.client_broadcast_unsubscribe(client_id, broadcast_id).await
+                }
+            },
+            C2SRequest::BroadcastStop { broadcast_id } => {
+                let room = handler_get_current_room!(server, client_id);
+
+                {
+                    let mut room = room.lock().await;
+                    room.client_broadcast_stop(client_id, broadcast_id).await
+                }
+            },
+
+            #[allow(unreachable_patterns)]
+            _ => S2CResponse::UnknownRequest,
         }
     }
 }

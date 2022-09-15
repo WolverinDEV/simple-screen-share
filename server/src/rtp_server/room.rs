@@ -9,7 +9,7 @@ use crate::rest_controller::auth::UserId;
 use futures::{future, future::FutureExt, Future, StreamExt};
 use log::info;
 use rand::{thread_rng, Rng};
-use rocket::tokio::{sync::Mutex, task};
+use rocket::tokio::{sync::{Mutex, oneshot}, task};
 use tokio_stream::Stream;
 
 use super::{
@@ -21,6 +21,7 @@ pub type RoomId = u64;
 
 pub enum RtpSourceEvent {
     Media(webrtc::rtp::packet::Packet),
+    End,
 }
 
 pub type BroadcastId = u32;
@@ -49,6 +50,9 @@ struct ClientBroadcast {
     waker: Option<Waker>,
     source: Pin<Box<dyn RtpSource>>,
     targets: BTreeMap<ClientId, Pin<Box<dyn RtpTarget>>>,
+
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_rx: oneshot::Receiver<()>,
 }
 
 impl Future for ClientBroadcast {
@@ -56,6 +60,10 @@ impl Future for ClientBroadcast {
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         use Poll::*;
+
+        if let Poll::Ready(_) = self.shutdown_rx.poll_unpin(cx) {
+            return Poll::Ready(());
+        }
 
         let mut pli_request = false;
         self.targets.drain_filter(|client_id, client| {
@@ -90,19 +98,17 @@ impl Future for ClientBroadcast {
                 Some(event) => event,
                 None => {
                     /* the stream has ended... */
-                    // TODO: Handle this properly!
                     return Poll::Ready(());
                 }
             };
 
             match event {
                 RtpSourceEvent::Media(mut packet) => {
-                    /* TODO: Send to everybody! */
-                    //trace!("TODO: Handle media event!");
                     for client in self.targets.values() {
                         client.send_rtp(&mut packet);
                     }
-                }
+                },
+                RtpSourceEvent::End => return Poll::Ready(())
             }
         }
 
@@ -167,11 +173,24 @@ impl Room {
                 .send_message(&notify::S2CNotify::NotifyUserJoined(client_id, user_id).into());
         }
 
-        let clients = self
-            .client_user_ids
-            .iter()
-            .filter(|(clid, _uid)| **clid != client_id)
-            .map(|(clid, uid)| (*clid, *uid))
+        let clients = self.clients
+            .keys()
+            .map(|client_id| {
+                let user_id = self.client_user_ids.get(client_id).unwrap_or(&0);
+                let mut broadcasts: BTreeMap<BroadcastId, String> = Default::default();
+
+                if let Some(client_broadcasts) = self.client_broadcasts.get(&client_id) {
+                    for (name, id) in client_broadcasts.iter() {
+                        broadcasts.insert(*id, name.clone());
+                    }
+                }
+
+                notify::NotifyUserEntry{
+                    client_id: *client_id,
+                    user_id: *user_id,
+                    broadcasts
+                }
+            })
             .collect::<Vec<_>>();
 
         client
@@ -193,12 +212,7 @@ impl Room {
 
         if let Some(broadcasts) = self.client_broadcasts.remove(&client_id) {
             for (_broadcast_name, broadcast_id) in broadcasts {
-                let _broadcast = match self.broadcasts.remove(&broadcast_id) {
-                    Some(broadcast) => broadcast,
-                    None => continue,
-                };
-
-                // TODO: Proper shutdown.
+                self.shutdown_broadcast(&broadcast_id);
             }
         }
 
@@ -258,6 +272,7 @@ impl Room {
             }
         }
 
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let broadcast = ClientBroadcast {
             id: broadcast_id,
             name: name.clone(),
@@ -268,12 +283,16 @@ impl Room {
             waker: None,
             source,
             targets: Default::default(),
+
+            shutdown_tx: Some(shutdown_tx),
+            shutdown_rx,
         };
         let broadcast = Arc::new(SyncMutex::new(broadcast));
 
         client_broadcasts.push((name.clone(), broadcast_id));
         self.broadcasts.insert(broadcast_id, broadcast.clone());
 
+        let weak_room = self.weak_ref.clone();
         task::spawn(async move {
             future::poll_fn(move |cx| {
                 let mut broadcast = broadcast.lock().unwrap();
@@ -282,11 +301,30 @@ impl Room {
             .await;
 
             info!("Client broadcast {} ended.", broadcast_id);
+            if let Some(room) = weak_room.upgrade() {
+                let mut room = room.lock().await;
+                room.broadcasts.remove(&broadcast_id);
+
+                for client in room.clients.values() {
+                    let mut other_client = client.lock().await;
+                    other_client.send_message(&notify::S2CNotify::NotifyBroadcastEnded(broadcast_id).into());
+                }
+            }
         });
 
         self.subscriber
             .iter()
             .for_each(|s| s.client_broadcast_started(self, client_id, &name));
+
+
+        for client in self.clients.values() {
+            let mut other_client = client.lock().await;
+            other_client.send_message(&notify::S2CNotify::NotifyBroadcastStarted{
+                broadcast_id,
+                client_id,
+                name: name.clone()
+            }.into());
+        }
 
         S2CResponse::BroadcastStarted { broadcast_id }
     }
@@ -295,7 +333,7 @@ impl Room {
         &mut self,
         client_id: ClientId,
         broadcast_id: BroadcastId,
-    ) -> Result<(), S2CResponse> {
+    ) -> S2CResponse {
         if let Some(broadcasts) = self.client_broadcasts.get_mut(&client_id) {
             let index = broadcasts
                 .iter()
@@ -305,23 +343,17 @@ impl Room {
 
             let index = match index {
                 Some(index) => index,
-                None => return Err(S2CResponse::BroadcastUnknownId),
+                None => return S2CResponse::BroadcastUnknownId,
             };
 
             broadcasts.remove(index);
         } else {
             /* Client has no broadcasts running or is unkown... */
-            return Err(S2CResponse::BroadcastUnknownId);
+            return S2CResponse::BroadcastUnknownId;
         }
 
-        let _broadcast = match self.broadcasts.remove(&broadcast_id) {
-            Some(broadcast) => broadcast,
-            // Should not happen since the broadcast was registered...
-            None => return Err(S2CResponse::BroadcastUnknownId),
-        };
-
-        /* FIXME: Shutdown! */
-        Ok(())
+        self.shutdown_broadcast(&broadcast_id);
+        S2CResponse::Success
     }
 
     pub async fn client_broadcast_subscribe(
@@ -329,15 +361,15 @@ impl Room {
         client_id: ClientId,
         broadcast_id: BroadcastId,
         target: Pin<Box<dyn RtpTarget>>,
-    ) -> Result<(), S2CResponse> {
+    ) -> S2CResponse {
         let broadcast = match self.broadcasts.get(&broadcast_id) {
             Some(broadcast) => broadcast,
-            None => return Err(S2CResponse::BroadcastUnknownId),
+            None => return S2CResponse::BroadcastUnknownId,
         };
 
         let mut broadcast = broadcast.lock().unwrap();
         if broadcast.targets.contains_key(&client_id) {
-            return Err(S2CResponse::BroadcastAlreadySubscribed);
+            return S2CResponse::BroadcastAlreadySubscribed;
         }
 
         broadcast.targets.insert(client_id, target);
@@ -346,24 +378,24 @@ impl Room {
             waker.wake_by_ref();
         }
 
-        Ok(())
+        S2CResponse::Success
     }
 
     pub async fn client_broadcast_unsubscribe(
         &mut self,
         client_id: ClientId,
         broadcast_id: BroadcastId,
-    ) -> Result<(), S2CResponse> {
+    ) -> S2CResponse {
         let broadcast = match self.broadcasts.get(&broadcast_id) {
             Some(broadcast) => broadcast,
-            None => return Err(S2CResponse::BroadcastUnknownId),
+            None => return S2CResponse::BroadcastUnknownId,
         };
 
         let mut broadcast = broadcast.lock().unwrap();
         let _target = match broadcast.targets.remove(&client_id) {
             Some(target) => target,
             // The client isn't subscribed. Therefor technically he "unsubscribed".
-            None => return Ok(()),
+            None => return S2CResponse::Success,
         };
 
         if let Some(waker) = &broadcast.waker {
@@ -371,7 +403,18 @@ impl Room {
             waker.wake_by_ref();
         }
 
-        Ok(())
+        S2CResponse::Success
+    }
+
+    fn shutdown_broadcast(&self, broadcast_id: &BroadcastId) {
+        let broadcast = match self.broadcasts.get(broadcast_id) {
+            Some(broadcast) => broadcast,
+            None => return,
+        };
+
+        if let Some(tx) = broadcast.lock().unwrap().shutdown_tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 

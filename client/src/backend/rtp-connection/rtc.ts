@@ -1,5 +1,7 @@
 import adapter from 'webrtc-adapter';
+import { RtpEvents } from '.';
 import { IceCandidate } from "../../../generated/rtp-messages";
+import { EventEmitter } from '../../utils/ee2';
 import { VirtualCamera } from "../../utils/virtual-camera";
 
 console.log("WebRTC adapter browserDetails %o", adapter.browserDetails);
@@ -25,10 +27,28 @@ export class RemoteTrack {
 
 export class LocalTrack {
     private readonly id: string;
+}
 
+type StreamType = "audio" | "video";
+
+export class RemoteStream {
+    readonly type: StreamType;
+    readonly streamId: string;
+    readonly track: MediaStreamTrack;
+
+    constructor(
+        type: StreamType,
+        streamId: string,
+        track: MediaStreamTrack,
+    ) {
+        this.type = type;
+        this.streamId = streamId;
+        this.track = track;
+    }
 }
 
 export class RtcConnection {
+    private readonly events: EventEmitter<RtpEvents>;
     readonly peer: RTCPeerConnection;
 
     private signalingConnection: RtpSignalingConnection | null;
@@ -39,8 +59,12 @@ export class RtcConnection {
     private cachedRemoteIceCandidates: IceCandidate[];
 
     private freeLocalVideoStreams: [string, RTCRtpSender][];
-
-    constructor() {
+    private remoteStreams: RemoteStream[];
+   
+    constructor(
+        events: EventEmitter<RtpEvents>
+    ) {
+        this.events = events;
         this.signalingConnection = null;
 
         this.localIceCandidatesFinished = false;
@@ -49,6 +73,7 @@ export class RtcConnection {
         this.remoteIceCandidatesFinished = false;
         this.cachedRemoteIceCandidates = [];
 
+        this.remoteStreams = [];
 
         this.peer = new RTCPeerConnection({
             iceServers: [{
@@ -93,36 +118,32 @@ export class RtcConnection {
         this.peer.ontrack = event => {
             // Track names are contained in the stream ids.
             if(event.streams.length !== 1) {
-                console.warn(`Received not unique identifyable track (contained in ${event.streams.length} streams).`);
+                console.log(event.receiver);
+                console.log(event.track);
+                console.log(event.transceiver);
+                console.warn(`Received not unique identifyable ${event.track.kind} track (contained in ${event.streams.length} streams).`);
                 return;
             }
+
             const trackId = event.streams[0].id;
+            const remoteStream = new RemoteStream(
+                event.track.kind === "video" ? "video" : "audio",
+                trackId,
+                event.track
+            );
+
+            this.remoteStreams.push(remoteStream);
+            this.events.emit("rtp.new_remote_stream", remoteStream.streamId);
+
             // readonly receiver: RTCRtpReceiver;
             // readonly streams: ReadonlyArray<MediaStream>;
             // readonly track: MediaStreamTrack;
             // readonly transceiver: RTCRtpTransceiver;
             console.log("Received track %s %s", event.track.kind, trackId);
-            if(event.track.kind === "video") {
-                const container = document.createElement("video");
-                container.srcObject = event.streams[0];
-                Object.assign(container.style, {
-                    width: '500px',
-                    height: '500px',
-                    position: 'absolute',
-                    top: '10px',
-                    left: '10px',
-                    zIndex: '500',
-                    background: 'blue'
-                });
-                container.muted = true;
-                container.autoplay = true;
-                document.body.appendChild(container);
-                container.play();
-            }
         };
 
         this.freeLocalVideoStreams = [];
-        for(let index = 0; index < 2; index++) {
+        for(let index = 0; index < 1; index++) {
             const stream = new MediaStream();
             const transceiver = this.peer.addTransceiver("video", {
                 direction: "sendrecv",
@@ -195,7 +216,7 @@ export class RtcConnection {
      * @returns local sdp offer
      */
     public async createLocalOffer() : Promise<string> {
-        const offer = await this.peer.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+        const offer = await this.peer.createOffer();
         await this.motifyLocalSdp(offer);
         
         console.groupCollapsed("SDP local offer");
@@ -274,9 +295,13 @@ export class RtcConnection {
                 sdpMLineIndex: 0,
                 candidate: `candidate:${candidate.candidate}`,
                 usernameFragment: candidate.ufrag
+            }).catch(error => {
+                console.warn(`Failed to add remote ice candidate ${candidate.candidate}: %s`, error.message);
             });
         } else {
-            await this.peer.addIceCandidate(undefined);
+            await this.peer.addIceCandidate(undefined).catch(error => {
+                console.warn(`Failed to add remote ice candidate finish: %s`, error.message);
+            });
         }
     }
 
@@ -338,5 +363,9 @@ export class RtcConnection {
         }
         // x-google-max-bitrate=2500
         sdp.sdp = lines.join("\n");
+    }
+
+    public getRemoteStreams() : RemoteStream[] {
+        return this.remoteStreams;
     }
 }
