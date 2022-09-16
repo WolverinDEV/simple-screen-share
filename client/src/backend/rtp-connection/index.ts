@@ -1,4 +1,4 @@
-import { IceCandidate } from "../../../generated/rtp-messages";
+import { BroadcastEntry, BroadcastKind, IceCandidate } from "../../../generated/rtp-messages";
 import { EventEmitter } from "../../utils/ee2";
 import { VirtualCamera } from "../../utils/virtual-camera";
 import { RemoteStream, RtcConnection, RtpSignalingConnection } from "./rtc";
@@ -9,9 +9,39 @@ export interface RtpEvents {
 
     "signalling.state_changed": [ newState: SignallingState, oldState: SignallingState ],
     "state_changed": [ newState: RtpConnectionState, oldState: RtpConnectionState ],
+
+
+    "user.received": void,
+    "user.joined": void,
+    "user.left": void,
+
+
+    // All broadcasts have been received.
+    "broadcast.received": void,
+    // A new broadcast has been created.
+    "broadcast.created": [broadcast: Broadcast],
+    "broadcast.ended": [broadcast: Broadcast],
 }
 
 type RtpConnectionState = "disconnected" | "connecting" | "initializing" | "connected";
+
+export class Broadcast {
+    // TODO: Type is it video or audio.
+    public readonly broadcastId: number;
+    public readonly name: string;
+    public readonly clientId: number;
+    public readonly kind: BroadcastKind;
+
+    // The stream id is available when we subscribed to that broadcast.
+    public streamId: string | null;
+
+    constructor(info: BroadcastEntry) {
+        this.broadcastId = info.broadcast_id;
+        this.name = info.name;
+        this.clientId = info.client_id;
+        this.kind = info.kind;
+    }
+}
 
 export class RtpConnection {
     readonly events: EventEmitter<RtpEvents>;
@@ -24,6 +54,8 @@ export class RtpConnection {
     private ownClientId: number;
     private ownUserId: number
 
+    private broadcasts: Broadcast[];
+
     constructor(serverUrl: string, connectToken: string) {
         this.events = new EventEmitter();
         this.connectToken = connectToken;
@@ -32,6 +64,7 @@ export class RtpConnection {
         this.rtcConnection = new RtcConnection(this.events);
 
         this.state = "disconnected";
+        this.broadcasts = [];
 
         this.events.on("signalling.state_changed", newState => {
             if(newState.status === "connected") {
@@ -47,13 +80,20 @@ export class RtpConnection {
             this.signallingConnection.sendRequest("NegotiationAnswer", { answer });  
         });
 
-        this.signallingConnection.registerNotifyHandler("NotifyUsers", users => console.info("Users: %o", users));
-        this.signallingConnection.registerNotifyHandler("NotifyBroadcastStarted", async broadcast => {
-            console.info("Broadcast started: %o", broadcast);
-            if(broadcast.client_id !== this.ownClientId) {
-                const response = await this.signallingConnection.sendRequest("BroadcastSubscribe", { broadcast_id: broadcast.broadcast_id });
-                console.log("Subscribe result: %o", response);
+        this.signallingConnection.registerNotifyHandler("NotifyBroadcasts", broadcasts => {
+            for(const broadcastInfo of broadcasts) {
+                const broadcast = new Broadcast(broadcastInfo);
+                this.broadcasts.push(broadcast);
             }
+
+            this.events.emit("broadcast.received");
+        });
+        this.signallingConnection.registerNotifyHandler("NotifyBroadcastStarted", async broadcastInfo => {
+            const broadcast = new Broadcast(broadcastInfo);
+            this.broadcasts.push(broadcast);
+
+            this.broadcasts.push(broadcast);
+            this.events.emit("broadcast.created", broadcast);
         });
 
         this.events.on("signalling.state_changed", newState => {
@@ -66,6 +106,18 @@ export class RtpConnection {
                     }
             }
         });
+
+        // Currently debugging stuff
+        {
+            this.events.on("broadcast.created", broadcast => {
+                this.subscribeBroadcast(broadcast.broadcastId);
+            });
+            this.events.on("broadcast.received", () => {
+                for(const broadcast of this.broadcasts) {
+                    this.subscribeBroadcast(broadcast.broadcastId);
+                }
+            });
+        }
     }
 
     public getState() : RtpConnectionState {
@@ -96,6 +148,7 @@ export class RtpConnection {
             if(result.type !== "SessionInitializeSuccess") {
                 // FIXME: Close/abort connection!
                 console.warn("Invalid initialize session result: %o", result);
+                this.updateState("disconnected");;
                 return;
             }
             
@@ -110,21 +163,54 @@ export class RtpConnection {
             
             // TODO: Remove me: This is debug.
             {
-                const vcam = new VirtualCamera(30, { width: 1080, height: 1080, });
-                vcam.start();
+                // {
+                //     const vcam = new VirtualCamera(30, { width: 1080, height: 1080, });
+                //     vcam.start();
 
-                const streamId = await this.rtcConnection.sendTrack(vcam.getMediaStream().getVideoTracks()[0]);
-                console.log("Starting VCam at %s", streamId);
-                const result = await this.signallingConnection.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId });
-                console.log("V-Cam start result: %o", result);
+                //     const streamId = await this.rtcConnection.sendTrack(vcam.getMediaStream().getVideoTracks()[0]);
+                //     const result = await this.signallingConnection.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId, kind: "Video" });
+                //     console.log("V-Cam start result: %o (%s)", result, streamId);
+                // }
+
                 
-                // await new Promise(resolve => setTimeout(resolve, 1000));
-                // console.log("Starting VCam at %s", streamId);
-                // await this.sendRequest("BroadcastStart", { name: "V-Cam 2", source: streamId });
-
-                // await new Promise(resolve => setTimeout(resolve, 1000));
-                // console.log("Starting VCam at %s", streamId);
-                // await this.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId });
+                navigator.mediaDevices
+                    .getUserMedia({ 
+                        audio: {
+                            deviceId: {
+                                exact: "0c82b236ca3b62e137a4cd00ba7c8edd1aa4fc6ca9fb684bb1a556608f92f632x"
+                            },
+                            echoCancellation: {
+                                exact: false
+                            },
+                        },
+                        video: {
+                            // "OBS-Camera" 05fff4c0016c994e756de288520758f63a7395d59be11d92d0a547e0dd37ae71
+                            // "OBS Virtual Camera" 6418c3c2d86d10a351f0a9652b9fb6e5621136f62e188a04bde20d2bac6ab9b3
+                            deviceId: {
+                                exact: "6418c3c2d86d10a351f0a9652b9fb6e5621136f62e188a04bde20d2bac6ab9b3"
+                            }
+                        },
+                    })
+                    .then(async stream => {
+                        const [ audioTrack ] = stream.getAudioTracks();
+                        if(audioTrack) {
+                            console.log("Got audio track. Sending it.");
+                            const streamId = await this.rtcConnection.sendTrack(audioTrack);
+                            const result = await this.signallingConnection.sendRequest("BroadcastStart", { name: "mic", source: streamId, kind: "Audio" });
+                            console.log("Audio start result: %o (%s)", result, streamId);
+                        }
+                        
+                        const [ videoTrack ] = stream.getVideoTracks();
+                        if(videoTrack) {
+                            console.log("Got video track. Sending it.");
+                            const streamId = await this.rtcConnection.sendTrack(videoTrack);
+                            const result = await this.signallingConnection.sendRequest("BroadcastStart", { name: "vid", source: streamId, kind: "Video" });
+                            console.log("Video start result: %o (%s)", result, streamId);
+                        }
+                    })
+                    .catch(error => {
+                        console.error(error);
+                    })
             }
         });
     }
@@ -166,6 +252,52 @@ export class RtpConnection {
     public getRemoteStream(streamId: string) : RemoteStream | null {
         return this.rtcConnection.getRemoteStreams()
             .find(stream => stream.streamId === streamId) ?? null;
+    }
+
+    public getBroadcasts() : Broadcast[] {
+        return this.broadcasts;
+    }
+
+    public getBroadcast(broadcastId: number) : Broadcast | null {
+        return this.broadcasts.find(broadcast => broadcast.broadcastId === broadcastId) ?? null;
+    }
+
+    public async unsubscribeBroadcast(broadcastId: number) {
+        const answer = await this.signallingConnection.sendRequest("BroadcastUnsubscribe", { broadcast_id: broadcastId });
+        if(answer.type !== "Success") {
+            console.warn("Failed to unsubscribe from broadcast %d: %s", broadcastId, answer.type);
+        }
+
+        const broadcast = this.getBroadcast(broadcastId);
+        if(broadcast) {
+            broadcast.streamId = undefined;
+        }
+    }
+
+    public async subscribeBroadcast(broadcastId: number) : Promise<string> {
+        const broadcast = this.getBroadcast(broadcastId);
+        if(!broadcast) {
+            throw new Error("invalid broadcast id");
+        }
+
+        if(broadcast.streamId) {
+            return broadcast.streamId;
+        }
+
+        const answer = await this.signallingConnection.sendRequest("BroadcastSubscribe", { broadcast_id: broadcastId });
+        if(answer.type === "BroadcastAlreadySubscribed") {
+            /* subscribeBroadcast has been called multiple times. */
+            if(broadcast.streamId) {
+                return broadcast.streamId;
+            }
+
+            throw new Error("broadcast subscribed but we don't have a stream id");
+        } else if(answer.type === "BroadcastSubscribed") {
+            broadcast.streamId = answer.payload.stream_id;
+            return broadcast.streamId;
+        } else {
+            throw new Error(`broadcast subscription failed ${answer.type}`);
+        }
     }
 
     public connect() {

@@ -48,7 +48,7 @@ pub mod request {
     use serde::Deserialize;
     use typescript_type_def::TypeDef;
 
-    use crate::rtp_server::room::BroadcastId;
+    use crate::rtp_server::room::{BroadcastId, BroadcastKind};
 
     use super::IceCandidate;
 
@@ -94,6 +94,7 @@ pub mod request {
     pub struct RequestBroadcastStart {
         pub name: String,
         pub source: String,
+        pub kind: BroadcastKind,
     }
 }
 
@@ -165,12 +166,10 @@ pub mod response {
 }
 
 pub mod notify {
-    use std::collections::BTreeMap;
-
     use serde::Serialize;
     use typescript_type_def::TypeDef;
 
-    use crate::{rest_controller::auth::UserId, rtp_server::{client::ClientId, room::BroadcastId}};
+    use crate::{rest_controller::auth::UserId, rtp_server::{client::ClientId, room::{BroadcastId, BroadcastKind}}};
 
     use super::IceCandidate;
 
@@ -183,7 +182,8 @@ pub mod notify {
 
         /// Will be send when joining a room.
         /// Contains all clients.
-        NotifyUsers(Vec<NotifyUserEntry>),
+        NotifyUsers(Vec<UserEntry>),
+        NotifyBroadcasts(Vec<BroadcastEntry>),
 
         /// Will be send when a new user joins the room.
         NotifyUserJoined(ClientId, UserId),
@@ -191,21 +191,23 @@ pub mod notify {
         /// Will be send when a user leaves the room.
         NotifyUserLeft(ClientId),
 
-        NotifyBroadcastStarted {
-            client_id: ClientId,
-            broadcast_id: BroadcastId,
-            name: String,
-        },
+        NotifyBroadcastStarted(BroadcastEntry),
 
         NotifyBroadcastEnded(BroadcastId),
     }
 
     #[derive(Debug, Serialize, TypeDef)]
-    pub struct NotifyUserEntry {
+    pub struct UserEntry {
         pub client_id: ClientId,
         pub user_id: UserId,
+    }
 
-        pub broadcasts: BTreeMap<BroadcastId, String>,
+    #[derive(Debug, Serialize, TypeDef)]
+    pub struct BroadcastEntry {
+        pub client_id: ClientId,
+        pub broadcast_id: BroadcastId,
+        pub name: String,
+        pub kind: BroadcastKind,
     }
 }
 #[derive(Debug, Serialize, TypeDef)]

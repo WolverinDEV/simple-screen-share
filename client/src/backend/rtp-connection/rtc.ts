@@ -2,6 +2,7 @@ import adapter from 'webrtc-adapter';
 import { RtpEvents } from '.';
 import { IceCandidate } from "../../../generated/rtp-messages";
 import { EventEmitter } from '../../utils/ee2';
+import { compressSdp } from './sdp';
 
 // Known bugs which need to be detected:
 // - Firefox ice candidate gathering may hangs up (browser restart required).
@@ -49,6 +50,30 @@ export class RemoteStream {
     }
 }
 
+class LocalStream {
+    readonly type: StreamType;
+    readonly streamId: string;
+    readonly sender: RTCRtpSender;
+
+    // Media stream used for allocating the transceiver.
+    readonly mediaStream: MediaStream;
+
+    constructor(mediaStream: MediaStream, type: StreamType, sender: RTCRtpSender) {
+        this.mediaStream = mediaStream;
+        this.type = type;
+        this.streamId = mediaStream.id;
+        this.sender = sender;
+    }
+
+    public setTrack(track: MediaStreamTrack) {
+        this.sender.replaceTrack(track);
+    }
+
+    public removeTrack() {
+        this.sender.replaceTrack(null);
+    }
+}
+
 export class RtcConnection {
     private readonly events: EventEmitter<RtpEvents>;
     readonly peer: RTCPeerConnection;
@@ -60,7 +85,7 @@ export class RtcConnection {
     private cachedLocalIceCandidates: IceCandidate[];
     private cachedRemoteIceCandidates: IceCandidate[];
 
-    private freeLocalVideoStreams: [string, RTCRtpSender][];
+    private localStreams: LocalStream[];
     private remoteStreams: RemoteStream[];
    
     constructor(events: EventEmitter<RtpEvents>) {
@@ -79,6 +104,9 @@ export class RtcConnection {
             iceServers: [{
                 urls: 'stun:stun.l.google.com:19302'
             }],
+
+            rtcpMuxPolicy: "require",
+            bundlePolicy: "balanced"
         });
 
         // @ts-ignore
@@ -142,30 +170,54 @@ export class RtcConnection {
             console.log("Received track %s %s", event.track.kind, trackId);
         };
 
-        this.freeLocalVideoStreams = [];
+        this.localStreams = [];
         for(let index = 0; index < 2; index++) {
-            const stream = new MediaStream();
-            const transceiver = this.peer.addTransceiver("video", {
-                direction: "sendrecv",
-                streams: [ stream ],
-            });
-            this.freeLocalVideoStreams.push([ stream.id, transceiver.sender ]);
+            this.allocateLocalStream("video");
+            this.allocateLocalStream("audio");
         }
     }
 
-    public async sendTrack(track: MediaStreamTrack) : Promise<string> {
-        if(this.peer.connectionState !== "connected") {
-            //throw new Error("peer not connected");
+    private allocateLocalStream(type: StreamType) : LocalStream {
+        const mediaStream = new MediaStream();
+        const transceiver = this.peer.addTransceiver(type, {
+            direction: "sendrecv",
+            streams: [ mediaStream ],
+        });
+
+        const localStream = new LocalStream(mediaStream, type, transceiver.sender);
+        this.localStreams.push(localStream);
+        return localStream;
+    }
+
+    public sendTrack(track: MediaStreamTrack) : string {
+        let type: StreamType;
+        if(track.kind === "video") {
+            type = "video";
+        } else if(track.kind === "audio") {
+            type = "audio";
+        } else {
+            throw new Error(`unsupported track kind ${track.kind}`);
         }
 
-        const [ streamId, sender ] = this.freeLocalVideoStreams.pop() ?? [];
-        if(!sender) {
-            // TODO: Renegotiate and allocate more slots.
-            throw new Error("no free video stream slots");
+        let localStream = this.localStreams.find(stream => stream.type === type && !stream.sender.track);
+        if(!localStream) {
+            localStream = this.allocateLocalStream(type);
         }
 
-        sender.replaceTrack(track);
-        return streamId;
+        localStream.setTrack(track);
+        return localStream.streamId;
+    }
+
+    public stopSending(track: MediaStreamTrack | string) {
+        if(typeof track === "string") {
+            const localStream = this.localStreams.find(stream => stream.streamId === track);
+            localStream?.removeTrack();
+        } else {
+            const localStreams = this.localStreams.filter(stream => stream.sender.track === track);
+            for(const localStream of localStreams) {
+                localStream.removeTrack();
+            }
+        }
     }
 
     public async applySignalingConnection(connection: RtpSignalingConnection) {
@@ -180,7 +232,7 @@ export class RtcConnection {
      * @returns local sdp offer
      */
     public async createLocalOffer() : Promise<string> {
-        const offer = await this.peer.createOffer({ offerToReceiveVideo: true });
+        const offer = await this.peer.createOffer({ /* offerToReceiveVideo: true */ });
         await this.motifyLocalSdp(offer);
         
         console.groupCollapsed("SDP local offer");
@@ -312,7 +364,7 @@ export class RtcConnection {
 
     // Modify local sdp before applying
     private async motifyLocalSdp(sdp: RTCSessionDescriptionInit) {
-
+        //setTimeout(() => console.log("Compressed: %o", compressSdp(sdp.sdp!)));
     }
 
     // Modify remote sdp before applying

@@ -6,10 +6,9 @@ import { Navigate, Route, Routes, useParams } from "react-router";
 import { ResponseRoomJoin } from "../../../../generated/rest-types";
 import { axiosClient } from "../../../backend/axios";
 import { RtpConnection } from "../../../backend/rtp-connection";
-import { SignallingConnection } from "../../../backend/rtp-connection/signaling";
+import { RemoteStream } from "../../../backend/rtp-connection/rtc";
 import { extractErrorMessage } from "../../../utils/error";
 import { useForceUpdate } from "../../hooks/force-render";
-import { useObservable } from "../../hooks/observable";
 
 export default React.memo(() => {
     return (
@@ -169,7 +168,7 @@ const RemoteStreamsRenderer = React.memo(() => {
         <Box>
             <Typography>Remote stream count: {streams.length}</Typography>
             {streams.map(stream => (
-                <RemoteStream
+                <RemoteStreamRenderer
                     key={stream.streamId}
                     streamId={stream.streamId}
                 />
@@ -178,23 +177,43 @@ const RemoteStreamsRenderer = React.memo(() => {
     );
 });
 
-const RemoteStream = React.memo((props: {
-    streamId: string,
+const RemoteStreamAudio = (props: {
+    stream: RemoteStream
 }) => {
-    const connection = useContext(ContextRtpConnection);
+    const { stream } = props;
+    const refVideo = useRef<HTMLVideoElement>();
+    useEffect(() => {
+        if(!refVideo.current) {
+            return;
+        }
 
-    const { streamId } = props;
-    const stream = connection.getRemoteStream(streamId);
-    if(!stream) {
-        return <Typography>Missing stream.</Typography>
-    };
+        const mstream = new MediaStream();
+        mstream.addTrack(stream.track);
+        refVideo.current.srcObject = mstream;
+        refVideo.current.play().catch(() => console.warn("Failed to start audio playback for %s", stream.streamId));
+    }, [ stream ]);
 
-    if(stream.type === "audio") {
-        return <Typography>Audio stream.</Typography>
-    }
+    return (
+        <Box>
+            <Box
+                ref={refVideo}
+                component={"video"}
+            
+                muted
+                autoPlay
+
+                controls={true}
+            />
+        </Box>
+    )
+};
+
+const RemoteStreamVideo = (props: {
+    stream: RemoteStream
+}) => {
+    const { stream } = props;
 
     const refVideo = useRef<HTMLVideoElement>();
-
     useEffect(() => {
         if(!refVideo.current) {
             return;
@@ -238,8 +257,35 @@ const RemoteStream = React.memo((props: {
 
                 borderBottomRightRadius: "5px",
             }}>
-                {streamId}
+                {stream.streamId}
             </Typography>
         </Box>
-    )
+    );
+}
+
+const RemoteStreamRenderer = React.memo((props: {
+    streamId: string,
+}) => {
+    const connection = useContext(ContextRtpConnection);
+
+    const { streamId } = props;
+    const stream = connection.getRemoteStream(streamId);
+    if(!stream) {
+        return <Typography>Missing stream.</Typography>
+    };
+
+    switch(stream.type) {
+        case "video":
+            return (
+                <RemoteStreamVideo stream={stream} />
+            );
+
+        case "audio":
+            return (
+                <RemoteStreamAudio stream={stream} />
+            );
+
+        default:
+            return <Typography>Unknown stream type {stream.type}</Typography>;
+    }
 });

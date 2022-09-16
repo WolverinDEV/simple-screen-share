@@ -15,6 +15,7 @@ futures = "0.3.24"
 jsonwebtoken = "8.1.1"
 log = "0.4.17"
 mongodb = "2.3.0"
+num-traits = "0.2.15"
 parking_lot = "0.12.1"
 rand = "0.8.5"
 rocket = { version = "0.5.0-rc.2", features = ["json"] }
@@ -27,3 +28,4 @@ tokio-tungstenite = "0.17.2"
 tungstenite = "0.17.3"
 typescript-type-def = { version = "0.5.4", features = ["serde_json"] }
 webrtc = "0.5.0"
+#webrtc = { path = 'third_party/webrtc/webrtc' }

@@ -7,14 +7,16 @@ use std::{
 
 use crate::rest_controller::auth::UserId;
 use futures::{future, future::FutureExt, Future, StreamExt};
-use log::info;
+use log::{info, trace};
 use rand::{thread_rng, Rng};
 use rocket::tokio::{sync::{Mutex, oneshot}, task};
+use serde::{Serialize, Deserialize};
 use tokio_stream::Stream;
+use typescript_type_def::TypeDef;
 
 use super::{
     client::{ClientId, SignalingClient},
-    messages::{notify, response::S2CResponse},
+    messages::{notify::{self, BroadcastEntry}, response::S2CResponse},
 };
 
 pub type RoomId = u64;
@@ -36,6 +38,8 @@ pub enum BroadcastTargetEvent {
 /// Source stream for a client broadcast
 pub trait RoomBroadcastSource: Stream<Item = BroadcastSourceEvent> + Send {
     fn send_pli(self: Pin<&mut Self>);
+
+    fn kind(&self) -> BroadcastKind;
 }
 
 
@@ -44,7 +48,14 @@ pub trait RoomBroadcastTarget: Stream<Item = BroadcastTargetEvent> + Send {
     fn send_rtp(&self, _packet: &mut webrtc::rtp::packet::Packet) {}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TypeDef)]
+pub enum BroadcastKind {
+    Audio,
+    Video,
+}
+
 struct ClientBroadcast {
+    kind: BroadcastKind,
     id: BroadcastId,
     name: String,
 
@@ -128,7 +139,7 @@ pub struct Room {
     pub subscriber: Vec<Arc<dyn RoomSubscriber>>,
     pub clients: BTreeMap<ClientId, Arc<Mutex<SignalingClient>>>,
     client_user_ids: BTreeMap<ClientId, UserId>,
-    client_broadcasts: BTreeMap<ClientId, Vec<(String, BroadcastId)>>,
+    client_broadcasts: BTreeMap<ClientId, Vec<BroadcastId>>,
 
     broadcasts: BTreeMap<BroadcastId, Arc<SyncMutex<ClientBroadcast>>>,
 }
@@ -177,30 +188,48 @@ impl Room {
                 .send_message(&notify::S2CNotify::NotifyUserJoined(client_id, user_id).into());
         }
 
-        let clients = self.clients
-            .keys()
-            .map(|client_id| {
-                let user_id = self.client_user_ids.get(client_id).unwrap_or(&0);
-                let mut broadcasts: BTreeMap<BroadcastId, String> = Default::default();
+        {
+            let clients = self.clients
+                .keys()
+                .map(|client_id| {
+                    let user_id = self.client_user_ids
+                        .get(client_id)
+                        .cloned()
+                        .unwrap_or(0);
 
-                if let Some(client_broadcasts) = self.client_broadcasts.get(&client_id) {
-                    for (name, id) in client_broadcasts.iter() {
-                        broadcasts.insert(*id, name.clone());
+                    notify::UserEntry{
+                        client_id: *client_id,
+                        user_id,
                     }
-                }
+                })
+                .collect::<Vec<_>>();
 
-                notify::NotifyUserEntry{
-                    client_id: *client_id,
-                    user_id: *user_id,
-                    broadcasts
-                }
-            })
-            .collect::<Vec<_>>();
+            client
+                .lock()
+                .await
+                .send_message(&notify::S2CNotify::NotifyUsers(clients).into());
+        }
 
-        client
-            .lock()
-            .await
-            .send_message(&notify::S2CNotify::NotifyUsers(clients).into());
+        {
+            let broadcasts = self.broadcasts
+                .values()
+                .map(|broadcast| {
+                    let broadcast = broadcast.lock().unwrap();
+                    
+                    BroadcastEntry{
+                        client_id: broadcast.client_id,
+                        broadcast_id: broadcast.id,
+                        kind: broadcast.kind,
+                        name: broadcast.name.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            client
+                .lock()
+                .await
+                .send_message(&notify::S2CNotify::NotifyBroadcasts(broadcasts).into());
+        }
     }
 
     pub async fn remove_client(&mut self, client_id: ClientId) {
@@ -215,7 +244,7 @@ impl Room {
         self.client_user_ids.remove(&client_id);
 
         if let Some(broadcasts) = self.client_broadcasts.remove(&client_id) {
-            for (_broadcast_name, broadcast_id) in broadcasts {
+            for broadcast_id in broadcasts {
                 self.shutdown_broadcast(&broadcast_id);
             }
         }
@@ -237,12 +266,20 @@ impl Room {
         None
     }
 
+    pub fn broadcast_kind(&self, broadcast_id: BroadcastId) -> Option<BroadcastKind> {
+        self.broadcasts
+            .get(&broadcast_id)
+            .map(|b| b.lock().unwrap().kind)
+    }
+
     pub async fn client_broadcast_start(
         &mut self,
         client_id: ClientId,
         name: String,
         source: Pin<Box<dyn RoomBroadcastSource>>,
     ) -> S2CResponse {
+        let broadcast_type = source.kind();
+
         let client = match self.clients.get(&client_id) {
             Some(client) => client,
             None => return S2CResponse::RoomNotJoined,
@@ -262,14 +299,14 @@ impl Room {
             Entry::Vacant(v) => v.insert(vec![]),
         };
 
-        for (_broadcast_name, broadcast_id) in client_broadcasts.iter() {
+        for broadcast_id in client_broadcasts.iter() {
             let broadcast = match self.broadcasts.get(broadcast_id) {
                 Some(broadcast) => broadcast,
                 None => continue, // Should no happen.
             };
 
             let broadcast = broadcast.lock().unwrap();
-            if broadcast.name.to_lowercase() == name.to_lowercase() {
+            if broadcast.kind == broadcast_type && broadcast.name.to_lowercase() == name.to_lowercase() {
                 return S2CResponse::BroadcastAlreadyRunning {
                     broadcast_id: *broadcast_id,
                 };
@@ -278,6 +315,7 @@ impl Room {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let broadcast = ClientBroadcast {
+            kind: broadcast_type,
             id: broadcast_id,
             name: name.clone(),
 
@@ -293,7 +331,7 @@ impl Room {
         };
         let broadcast = Arc::new(SyncMutex::new(broadcast));
 
-        client_broadcasts.push((name.clone(), broadcast_id));
+        client_broadcasts.push(broadcast_id);
         self.broadcasts.insert(broadcast_id, broadcast.clone());
 
         let weak_room = self.weak_ref.clone();
@@ -313,21 +351,26 @@ impl Room {
                     let mut other_client = client.lock().await;
                     other_client.send_message(&notify::S2CNotify::NotifyBroadcastEnded(broadcast_id).into());
                 }
+                
+                room.subscriber
+                    .iter()
+                    .for_each(|s| s.client_broadcast_ended(&room, client_id, broadcast_id));
             }
         });
 
         self.subscriber
             .iter()
-            .for_each(|s| s.client_broadcast_started(self, client_id, &name));
+            .for_each(|s| s.client_broadcast_started(self, client_id, broadcast_id));
 
 
         for client in self.clients.values() {
             let mut other_client = client.lock().await;
-            other_client.send_message(&notify::S2CNotify::NotifyBroadcastStarted{
+            other_client.send_message(&notify::S2CNotify::NotifyBroadcastStarted(BroadcastEntry{
                 broadcast_id,
                 client_id,
-                name: name.clone()
-            }.into());
+                name: name.clone(),
+                kind: broadcast_type,
+            }).into());
         }
 
         S2CResponse::BroadcastStarted { broadcast_id }
@@ -341,9 +384,7 @@ impl Room {
         if let Some(broadcasts) = self.client_broadcasts.get_mut(&client_id) {
             let index = broadcasts
                 .iter()
-                .enumerate()
-                .find(|(_idx, (_name, id))| *id == broadcast_id)
-                .map(|(idx, _)| idx);
+                .position(|id| *id == broadcast_id);
 
             let index = match index {
                 Some(index) => index,
@@ -441,14 +482,14 @@ pub trait RoomSubscriber: Sync + Send {
     ) {
     }
 
-    // TODO: Broadcast type!
     fn client_broadcast_started(
         &self,
         _room: &Room,
         _client_id: ClientId,
-        _broadcast_name: &String,
+        _broadcast_id: BroadcastId,
     ) {
     }
-    fn client_broadcast_ended(&self, _room: &Room, _client_id: ClientId, _broadcast_name: &String) {
+
+    fn client_broadcast_ended(&self, _room: &Room, _client_id: ClientId, _broadcast_id: BroadcastId) {
     }
 }

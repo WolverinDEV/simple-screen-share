@@ -495,7 +495,7 @@ impl ClientRequestHandler for ServerClientHandler {
 
                 let source = {
                     let mut rtp_client = rtp_client.lock().await;
-                    rtp_client.create_broadcast_source(&payload.source)
+                    rtp_client.create_broadcast_source(&payload.source, payload.kind)
                 };
 
                 let broadcast_id = {
@@ -520,9 +520,19 @@ impl ClientRequestHandler for ServerClientHandler {
                     None => return S2CResponse::RtpNotInitialized,
                 };
                 
+                let broadcast_kind = {
+                    let room = room.lock().await;
+                    room.broadcast_kind(broadcast_id)
+                };
+
+                let broadcast_kind = match broadcast_kind {
+                    Some(broadcast_kind) => broadcast_kind,
+                    None => return S2CResponse::BroadcastUnknownId,
+                };
+
                 let (target_id, target) = {
                     let mut rtp_client = rtp_client.lock().await;
-                    rtp_client.create_broadcast_target().await
+                    rtp_client.create_broadcast_target(broadcast_kind).await
                 };
 
                 {

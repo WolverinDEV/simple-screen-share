@@ -58,10 +58,11 @@ use crate::rtp_server::messages::notify;
 use super::{
     client::{ClientId, SignalingClient},
     messages::{IceCandidate, S2CMessage},
-    room::{RoomBroadcastSource, BroadcastSourceEvent, RoomBroadcastTarget, BroadcastTargetEvent},
+    room::{RoomBroadcastSource, BroadcastSourceEvent, RoomBroadcastTarget, BroadcastTargetEvent, BroadcastKind},
 };
 
 struct ClientBroadcastSource {
+    kind: BroadcastKind,
     weak_track: Weak<RegisteredReceivingTrack>,
 
     events: mpsc::Receiver<BroadcastSourceEvent>,
@@ -85,6 +86,10 @@ impl RoomBroadcastSource for ClientBroadcastSource {
                     .await;
             }
         });
+    }
+
+    fn kind(&self) -> BroadcastKind {
+        self.kind
     }
 }
 
@@ -175,6 +180,8 @@ struct ReceivingTrackBinding {
 }
 
 struct RegisteredReceivingTrack {
+    kind: RTPCodecType,
+
     stream_id: String,
     weak_client: Weak<Mutex<RtpClient>>,
 
@@ -218,6 +225,7 @@ async fn registered_receive_track_io_loop(receiving_track: Arc<RegisteredReceivi
         handler.handle_mount(binding.clone());
     }
 
+    trace!("Track {} got it's binding. Starting io loop.", receiving_track.stream_id);
     loop {
         select! {
             rtp = binding.track.read_rtp() => {
@@ -356,6 +364,8 @@ struct SendingTrackBinding {
 }
 
 struct RegisteredSendingTrack {
+    kind: RTPCodecType,
+
     id: String,
     binding: parking_lot::Mutex<Option<Arc<SendingTrackBinding>>>,
 
@@ -397,7 +407,7 @@ impl RegisteredSendingTrack {
             }
         } else if let Some(_rr) = event.as_any().downcast_ref::<ReceiverReport>() {
             // TODO: Get current track id and extract own report.
-            trace!("Received ReceiverReport.");
+            //trace!("Received ReceiverReport.");
         } else if let Some(_nack) = event.as_any().downcast_ref::<TransportLayerNack>() {
             /* Nack handling itself already done by an interceptor. */
         } else if let Some(_remb) = event.as_any().downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
@@ -422,7 +432,7 @@ impl TrackLocal for RegisteredSendingTrack {
         let codec = ctx
             .codec_parameters()
             .iter()
-            .find(|p| p.capability.mime_type == MIME_TYPE_VP8)
+            .find(|p| if self.kind == RTPCodecType::Audio { p.capability.mime_type == MIME_TYPE_OPUS } else { p.capability.mime_type == MIME_TYPE_VP8 } )
             .ok_or(webrtc::error::Error::ErrCodecNotFound)?;
 
         *self.binding.lock() = Some(Arc::new(SendingTrackBinding {
@@ -450,7 +460,7 @@ impl TrackLocal for RegisteredSendingTrack {
     }
 
     fn kind(&self) -> RTPCodecType {
-        RTPCodecType::Video
+        self.kind
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1013,7 +1023,8 @@ impl RtpClient {
                     let stream_id = track.stream_id().await;
 
                     info!(
-                        "Received track ssrc = {}, id = {}, sid = {}, rid = {}",
+                        "Received {} track ssrc = {}, id = {}, sid = {}, rid = {}",
+                        track.kind(),
                         track.ssrc(),
                         track.id().await,
                         track.stream_id().await,
@@ -1028,7 +1039,7 @@ impl RtpClient {
 
                     let receiving_stream = match receiving_stream {
                         Some(receiving_stream) => receiving_stream,
-                        None => client.create_receiving_track(stream_id)
+                        None => client.create_receiving_track(stream_id, track.kind())
                     };
 
                     let binding_tx = {
@@ -1082,9 +1093,10 @@ impl RtpClient {
         trace!("Peer connection closed");
     }
 
-    fn create_receiving_track(&mut self, stream_id: String) -> Arc<RegisteredReceivingTrack> {
+    fn create_receiving_track(&mut self, stream_id: String, kind: RTPCodecType) -> Arc<RegisteredReceivingTrack> {
         let (binding_tx, binding_rx) = oneshot::channel();
         let track = RegisteredReceivingTrack {
+            kind,
             stream_id,
             weak_client: self.weak_ref.clone(),
             
@@ -1125,7 +1137,12 @@ impl RtpClient {
         track
     }
 
-    pub fn create_broadcast_source(&mut self, stream_id: &str) -> Pin<Box<dyn RoomBroadcastSource>> {
+    pub fn create_broadcast_source(&mut self, stream_id: &str, broadcast_kind: BroadcastKind) -> Pin<Box<dyn RoomBroadcastSource>> {
+        let kind = match broadcast_kind {
+            BroadcastKind::Video => RTPCodecType::Video,
+            BroadcastKind::Audio => RTPCodecType::Audio,
+        };
+
         let stream = self.receiving_tracks
             .iter_mut()
             .find(|t| t.stream_id == stream_id)
@@ -1133,8 +1150,10 @@ impl RtpClient {
 
         let stream = match stream {
             Some(stream) => stream,
-            None => self.create_receiving_track(stream_id.to_string()),
+            None => self.create_receiving_track(stream_id.to_string(), kind),
         };
+
+        // FIXME: Validate that the stream kind is actually the target kind.
 
         let (events_tx, events_rx) = mpsc::channel(16);
         let handler = Arc::new(ReceivingTrackBroadcastHandler{
@@ -1143,6 +1162,7 @@ impl RtpClient {
         });
 
         let source = Box::pin(ClientBroadcastSource{
+            kind: broadcast_kind,
             weak_track: Arc::downgrade(&stream),
             events: events_rx,
             recv_handler: handler.clone(),
@@ -1152,7 +1172,7 @@ impl RtpClient {
         source
     }
 
-    async fn create_sending_track(&mut self) -> webrtc::error::Result<Arc<RegisteredSendingTrack>> {
+    async fn create_sending_track(&mut self, kind: RTPCodecType) -> webrtc::error::Result<Arc<RegisteredSendingTrack>> {
         let id: String = thread_rng()
             .sample_iter(&Alphanumeric)
             .take(16)
@@ -1161,6 +1181,7 @@ impl RtpClient {
 
         let (rtp_tx, rtp_rx) = mpsc::channel(1024);
         let track = Arc::new(RegisteredSendingTrack {
+            kind,
             binding: Default::default(),
             id,
 
@@ -1190,12 +1211,16 @@ impl RtpClient {
 
         // TODO: Error after 10s if the track never binds.
 
-
         self.sending_tracks.push_back(track.clone());
         Ok(track)
     }
 
-    pub async fn create_broadcast_target(&mut self) -> (String, Pin<Box<dyn RoomBroadcastTarget>>) {
+    pub async fn create_broadcast_target(&mut self, broadcast_kind: BroadcastKind) -> (String, Pin<Box<dyn RoomBroadcastTarget>>) {
+        let kind = match broadcast_kind {
+            BroadcastKind::Video => RTPCodecType::Video,
+            BroadcastKind::Audio => RTPCodecType::Audio,
+        };
+
         let track = self.sending_tracks
             .iter()
             .find(|track| track.event_handler.lock().is_none())
@@ -1204,7 +1229,7 @@ impl RtpClient {
         let track = match track {
             Some(track) => track,
             None => {
-                let track = self.create_sending_track().await.unwrap();
+                let track = self.create_sending_track(kind).await.unwrap();
 
                 // Sadly currently manually needed...
                 //let _ = self.execute_renegotiation(true).await;
