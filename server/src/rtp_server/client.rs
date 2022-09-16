@@ -36,7 +36,7 @@ pub struct SignalingClient {
     pub client_id: ClientId,
 
     weak_ref: Weak<Mutex<Self>>,
-    pub subscriber: Vec<Arc<dyn ConnectedClientSubscriber>>,
+    pub subscriber: Vec<Arc<dyn SignalingClientSubscriber>>,
 
     pub address: SocketAddr,
 
@@ -346,7 +346,7 @@ impl SignalingClient {
     }
 }
 
-pub trait ConnectedClientSubscriber: Sync + Send {
+pub trait SignalingClientSubscriber: Sync + Send {
     /// Note: This might never be called since the client can already be connected when the subscriber gets registered.
     fn connected(&self) {}
     fn connection_closing(&self) {}

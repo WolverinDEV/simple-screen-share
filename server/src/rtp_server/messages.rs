@@ -101,7 +101,7 @@ pub mod response {
     use serde::Serialize;
     use typescript_type_def::TypeDef;
 
-    use crate::rtp_server::room::BroadcastId;
+    use crate::{rtp_server::{room::BroadcastId, client::ClientId}, rest_controller::auth::UserId};
 
     #[derive(Debug, Serialize, TypeDef)]
     #[serde(tag = "type", content = "payload")]
@@ -132,6 +132,8 @@ pub mod response {
         /* Response for the InitializeSession request. */
         SessionInitializeSuccess {
             answer: String,
+            own_client_id: ClientId,
+            own_user_id: UserId,
         },
         SessionAlreadyInitialized,
         SessionInvalidToken,
@@ -156,6 +158,9 @@ pub mod response {
             broadcast_id: BroadcastId,
         },
         BroadcastUnknownId,
+        BroadcastSubscribed {
+            stream_id: String,
+        }
     }
 }
 

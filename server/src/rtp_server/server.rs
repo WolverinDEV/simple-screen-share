@@ -16,7 +16,7 @@ use rocket::{
 use crate::SERVER_REQUEST_VERSION;
 
 use super::{
-    client::{ClientId, ClientRequestHandler, ConnectedClientSubscriber, SignalingClient},
+    client::{ClientId, ClientRequestHandler, SignalingClientSubscriber, SignalingClient},
     client_rtp::RtpClient,
     messages::{
         request::{self, C2SRequest},
@@ -249,7 +249,7 @@ struct ServerClientSubscriber {
     weak_client: Weak<Mutex<SignalingClient>>,
 }
 
-impl ConnectedClientSubscriber for ServerClientSubscriber {
+impl SignalingClientSubscriber for ServerClientSubscriber {
     fn connection_closing(&self) {
         // TODO: Unregister the client from all rooms etc.
     }
@@ -415,7 +415,7 @@ impl ClientRequestHandler for ServerClientHandler {
                     server.client_rooms.insert(client_id, room_id);
                 }
 
-                return S2CResponse::SessionInitializeSuccess { answer: sdp_answer };
+                return S2CResponse::SessionInitializeSuccess { answer: sdp_answer, own_user_id: token_info.user_id, own_client_id: client_id };
             }
             C2SRequest::NegotiationOffer(payload) => {
                 let rtp_client = match server.lock().await.rtp_clients.get(&client_id).cloned() {
@@ -495,7 +495,7 @@ impl ClientRequestHandler for ServerClientHandler {
 
                 let source = {
                     let mut rtp_client = rtp_client.lock().await;
-                    rtp_client.create_rtc_source(&payload.source)
+                    rtp_client.create_broadcast_source(&payload.source)
                 };
 
                 let source = match source {
@@ -525,9 +525,9 @@ impl ClientRequestHandler for ServerClientHandler {
                     None => return S2CResponse::RtpNotInitialized,
                 };
                 
-                let target = {
+                let (target_id, target) = {
                     let mut rtp_client = rtp_client.lock().await;
-                    rtp_client.create_rtc_target().await
+                    rtp_client.create_broadcast_target().await
                 };
 
                 {
@@ -539,8 +539,7 @@ impl ClientRequestHandler for ServerClientHandler {
                     }
                 };
 
-                // TODO: Return the stream id...
-                S2CResponse::Success
+                S2CResponse::BroadcastSubscribed { stream_id: target_id }
             },
             C2SRequest::BroadcastUnsubscribe { broadcast_id } => {
                 let room = handler_get_current_room!(server, client_id);

@@ -5,9 +5,10 @@ import { useQuery } from "react-query";
 import { Navigate, Route, Routes, useParams } from "react-router";
 import { ResponseRoomJoin } from "../../../../generated/rest-types";
 import { axiosClient } from "../../../backend/axios";
-import { RtpServerConnection } from "../../../backend/rtp-connection/signaling";
+import { RtpConnection } from "../../../backend/rtp-connection";
+import { SignallingConnection } from "../../../backend/rtp-connection/signaling";
 import { extractErrorMessage } from "../../../utils/error";
-import { useForceRender } from "../../hooks/force-render";
+import { useForceUpdate } from "../../hooks/force-render";
 import { useObservable } from "../../hooks/observable";
 
 export default React.memo(() => {
@@ -95,10 +96,10 @@ const RoomJoinPending = React.memo((props: {
     );
 });
 
-const ContextRtpConnection = React.createContext<RtpServerConnection>(undefined);
+const ContextRtpConnection = React.createContext<RtpConnection>(undefined);
 const JoinedRoom = React.memo((props: { token: string, serverUrl: string }) => {
     const connection = useMemo(() => {
-        const connection = new RtpServerConnection(props.serverUrl, props.token);
+        const connection = new RtpConnection(props.serverUrl, props.token);
         connection.connect();
         // @ts-ignore
         window.connection = connection;
@@ -106,9 +107,6 @@ const JoinedRoom = React.memo((props: { token: string, serverUrl: string }) => {
         return connection;
     }, [ props.token, props.serverUrl ]);
 
-    if(connection.state.value.status === "connected") {
-
-    }
     return (
         <ContextRtpConnection.Provider value={connection}>
             <ConnectionConnecting />
@@ -118,11 +116,17 @@ const JoinedRoom = React.memo((props: { token: string, serverUrl: string }) => {
     );
 });
 
+const useConnectionState = () => {
+    const connection = useContext(ContextRtpConnection);
+    const forceUpdate = useForceUpdate();
+    useEffect(() => connection.events.on("state_changed", forceUpdate), [ connection ]);
+    return connection.getState();
+}
+
 
 const ConnectionConnecting = React.memo(() => {
-    const connection = useContext(ContextRtpConnection);
-    const value = useObservable(connection.state);
-    if(value.status !== "connecting") {
+    const state = useConnectionState();
+    if(state !== "connecting" && state !== "initializing") {
         return null;
     }
 
@@ -132,9 +136,8 @@ const ConnectionConnecting = React.memo(() => {
 });
 
 const ConnectionDisconnected = React.memo(() => {
-    const connection = useContext(ContextRtpConnection);
-    const value = useObservable(connection.state);
-    if(value.status !== "disconnected" && value.status !== "unconnected") {
+    const state = useConnectionState();
+    if(state !== "disconnected") {
         return null;
     }
 
@@ -145,8 +148,8 @@ const ConnectionDisconnected = React.memo(() => {
 
 const ConnectionConnected = React.memo(() => {
     const connection = useContext(ContextRtpConnection);
-    const value = useObservable(connection.state);
-    if(value.status !== "connected") {
+    const state = useConnectionState();
+    if(state !== "connected") {
         return null;
     }
 
@@ -157,7 +160,7 @@ const ConnectionConnected = React.memo(() => {
 
 const RemoteStreamsRenderer = React.memo(() => {
     const connection = useContext(ContextRtpConnection);
-    const rerender = useForceRender();
+    const rerender = useForceUpdate();
 
     useEffect(() => connection.events.on("rtp.new_remote_stream", rerender), [ connection ]);
 

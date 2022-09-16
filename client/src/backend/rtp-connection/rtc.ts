@@ -2,7 +2,6 @@ import adapter from 'webrtc-adapter';
 import { RtpEvents } from '.';
 import { IceCandidate } from "../../../generated/rtp-messages";
 import { EventEmitter } from '../../utils/ee2';
-import { VirtualCamera } from "../../utils/virtual-camera";
 
 console.log("WebRTC adapter browserDetails %o", adapter.browserDetails);
 export interface RtpSignalingConnection {
@@ -61,9 +60,7 @@ export class RtcConnection {
     private freeLocalVideoStreams: [string, RTCRtpSender][];
     private remoteStreams: RemoteStream[];
    
-    constructor(
-        events: EventEmitter<RtpEvents>
-    ) {
+    constructor(events: EventEmitter<RtpEvents>) {
         this.events = events;
         this.signalingConnection = null;
 
@@ -165,48 +162,12 @@ export class RtcConnection {
         }
 
         sender.replaceTrack(track);
-        // TODO: The server currently only knows this stream id if every data has been send on it.
-        await new Promise(resolve => setTimeout(resolve, 3_000));
         return streamId;
     }
 
     public async applySignalingConnection(connection: RtpSignalingConnection) {
         this.signalingConnection = connection;
         this.processPendingIceCandidates();
-
-        // {
-        //     const vcam = new VirtualCamera(30, { width: 1920, height: 1080, });
-        //     vcam.start();
-
-        //     const _stream = new MediaStream();
-            
-        //     const stream = vcam.getMediaStream();
-        //     const videoTrack = stream.getVideoTracks()[0];
-        //     //const transceiver = this.peer.addTransceiver("video");
-           
-        //     const trackSender = this.peer.addTransceiver(videoTrack, {
-        //         direction: "sendonly",
-        //         streams: [ _stream ],
-        //         // sendEncodings: [
-        //         //     { rid: "h", maxBitrate: 1200 * 1024, scaleResolutionDownBy: 1, active: true },
-        //         //     { rid: "m", maxBitrate:  600 * 1024, scaleResolutionDownBy: 2, active: true },
-        //         //     { rid: "l", maxBitrate:  300 * 1024, scaleResolutionDownBy: 4, active: true }
-        //         // ]
-        //     });
-        //     console.error("Stream ID: %s", _stream.id);
-        //     console.error("Sender mid: %s", trackSender.mid);
-        //     console.error("Parameters: %o", trackSender.sender.getParameters());
-        //     //videoTrack.stop();
-        //     // setTimeout(() => { 
-        //     //     const vcam = new VirtualCamera(30, { width: 1920, height: 1080, });
-        //     //     vcam.start();
-        //     //     const vtrack = vcam.getMediaStream().getVideoTracks()[0];
-
-        //     //     //this.peer.removeTrack(st);
-        //     //     st = this.peer.addTrack(vtrack, _stream);
-        //     //  }, 5_000);
-        //     // console.error("Virtual Stream: %o", _stream.id);
-        // }
     }
 
     /**

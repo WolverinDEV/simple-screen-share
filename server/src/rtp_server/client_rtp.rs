@@ -10,7 +10,7 @@ use rocket::{
 };
 use std::{
     collections::VecDeque,
-    ops::{DerefMut, Deref},
+    ops::{Deref},
     pin::Pin,
     sync::{Arc, Weak, atomic::{AtomicBool}},
     task::{Context, Poll},
@@ -29,7 +29,6 @@ use webrtc::{
     peer_connection::{
         configuration::RTCConfiguration,
         sdp::{sdp_type::RTCSdpType, session_description::RTCSessionDescription},
-        signaling_state::RTCSignalingState,
         RTCPeerConnection,
     },
     rtcp::{
@@ -58,21 +57,21 @@ use crate::rtp_server::messages::notify;
 use super::{
     client::{ClientId, SignalingClient},
     messages::{IceCandidate, S2CMessage},
-    room::{RtpSource, RtpSourceEvent, RtpTarget, RtpTargetEvent},
+    room::{RoomBroadcastSource, BroadcastSourceEvent, RoomBroadcastTarget, BroadcastTargetEvent},
 };
 
-struct RtpClientTrackSource {
+struct ClientBroadcastSource {
     weak_track: Weak<RegisteredReceivingTrack>,
 
     ssrc: SSRC,
-    events: mpsc::Receiver<RtpSourceEvent>,
+    events: mpsc::Receiver<BroadcastSourceEvent>,
     rtcp_sender: RtcpSender,
 
-    recv_handler: Arc<RtpSourceHandler>,
+    recv_handler: Arc<ReceivingTrackBroadcastHandler>,
 }
 
-impl RtpSource for RtpClientTrackSource {
-    fn pli_request(self: Pin<&mut Self>) {
+impl RoomBroadcastSource for ClientBroadcastSource {
+    fn send_pli(self: Pin<&mut Self>) {
         let sender = self.rtcp_sender.clone();
         let ssrc = self.ssrc;
         tokio::spawn(async move {
@@ -86,15 +85,15 @@ impl RtpSource for RtpClientTrackSource {
     }
 }
 
-impl Stream for RtpClientTrackSource {
-    type Item = RtpSourceEvent;
+impl Stream for ClientBroadcastSource {
+    type Item = BroadcastSourceEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.events.poll_recv(cx)
     }
 }
 
-impl Drop for RtpClientTrackSource {
+impl Drop for ClientBroadcastSource {
     fn drop(&mut self) {
         if let Some(track) = self.weak_track.upgrade() {
             // Remove the handler from the track.
@@ -104,14 +103,14 @@ impl Drop for RtpClientTrackSource {
     }
 }
 
-struct RtpSourceHandler {
-    events: mpsc::Sender<RtpSourceEvent>,
+struct ReceivingTrackBroadcastHandler {
+    events: mpsc::Sender<BroadcastSourceEvent>,
 }
 
 #[async_trait]
-impl ReceivingTrackHandler for RtpSourceHandler {
+impl ReceivingTrackHandler for ReceivingTrackBroadcastHandler {
     async fn handle_rtp_packet(&self, packet: webrtc::rtp::packet::Packet) {
-        let _ = self.events.send(RtpSourceEvent::Media(packet)).await;
+        let _ = self.events.send(BroadcastSourceEvent::Media(packet)).await;
     }
 
     async fn handle_rtcp_packet(&self, packet: Box<dyn webrtc::rtcp::packet::Packet + Send + Sync>) {
@@ -129,11 +128,11 @@ impl ReceivingTrackHandler for RtpSourceHandler {
 
 
     async fn handle_unmount(&self) {
-        let _ = self.events.send(RtpSourceEvent::End).await;
+        let _ = self.events.send(BroadcastSourceEvent::End).await;
     }
 
     async fn handle_closed(&self) {
-        let _ = self.events.send(RtpSourceEvent::End).await;
+        let _ = self.events.send(BroadcastSourceEvent::End).await;
     }
 }
 
@@ -286,27 +285,27 @@ impl Drop for RegisteredReceivingTrack {
     }
 }
 
-struct RtpClientTarget {
+struct ClientBroadcastTarget {
     weak_client: Weak<Mutex<RtpClient>>,
     track: Arc<RegisteredSendingTrack>,
-    events: mpsc::Receiver<RtpTargetEvent>,
+    events: mpsc::Receiver<BroadcastTargetEvent>,
 }
 
-impl RtpTarget for RtpClientTarget {
+impl RoomBroadcastTarget for ClientBroadcastTarget {
     fn send_rtp(&self, packet: &mut webrtc::rtp::packet::Packet) {
         let _ = self.track.rtp_send_channel.try_send(packet.clone());
     }
 }
 
-impl Stream for RtpClientTarget {
-    type Item = RtpTargetEvent;
+impl Stream for ClientBroadcastTarget {
+    type Item = BroadcastTargetEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.events.poll_recv(cx)
     }
 }
 
-impl Drop for RtpClientTarget {
+impl Drop for ClientBroadcastTarget {
     fn drop(&mut self) {
         // TODO: Remove the handler from the track and allow other clients to use that track
     }
@@ -321,16 +320,21 @@ struct SendingTrackBinding {
 
 struct RegisteredSendingTrack {
     id: String,
-    binding: Mutex<Option<SendingTrackBinding>>,
+    binding: parking_lot::Mutex<Option<Arc<SendingTrackBinding>>>,
 
     shutdown_tx: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
-    event_handler: parking_lot::Mutex<Option<mpsc::Sender<RtpTargetEvent>>>,
+    event_handler: parking_lot::Mutex<Option<mpsc::Sender<BroadcastTargetEvent>>>,
 
     rtp_send_channel: mpsc::Sender<webrtc::rtp::packet::Packet>,
 }
 
 impl RegisteredSendingTrack {
-    fn get_event_handler(&self) -> Option<mpsc::Sender<RtpTargetEvent>> {
+    fn get_binding(&self) -> Option<Arc<SendingTrackBinding>> {
+        let binding = self.binding.lock();
+        binding.deref().clone()
+    }
+
+    fn get_event_handler(&self) -> Option<mpsc::Sender<BroadcastTargetEvent>> {
         let handler = self.event_handler.lock();
         handler.deref().clone()
     }
@@ -352,7 +356,7 @@ impl RegisteredSendingTrack {
             );
 
             if let Some(handler) = self.get_event_handler() {
-                let _ = handler.send(RtpTargetEvent::RequestPli).await;
+                let _ = handler.send(BroadcastTargetEvent::RequestPli).await;
             }
         } else if let Some(_rr) = event.as_any().downcast_ref::<ReceiverReport>() {
             // TODO: Get current track id and extract own report.
@@ -382,19 +386,19 @@ impl TrackLocal for RegisteredSendingTrack {
             .find(|p| p.capability.mime_type == MIME_TYPE_VP8)
             .ok_or(webrtc::error::Error::ErrCodecNotFound)?;
 
-        *self.binding.lock().await = Some(SendingTrackBinding {
+        *self.binding.lock() = Some(Arc::new(SendingTrackBinding {
             id: ctx.id().clone(),
             ssrc: ctx.ssrc(),
 
             payload_type: codec.payload_type,
             write_stream,
-        });
+        }));
 
         Ok(codec.clone())
     }
 
     async fn unbind(&self, _ctx: &TrackLocalContext) -> webrtc::error::Result<()> {
-        self.binding.lock().await.take();
+        self.binding.lock().take();
         Ok(())
     }
 
@@ -473,10 +477,11 @@ async fn registered_send_track_io_loop(track: Arc<RegisteredSendingTrack>, sende
                 break;
             },
             LoopEvent::RtpSend(mut packet) => {
-                let binding = track.binding.lock().await;
-                if let Some(binding) = binding.as_ref() {
+                if let Some(binding) = track.get_binding() {
                     packet.header.ssrc = binding.ssrc;
                     packet.header.payload_type = binding.payload_type;
+
+                    // TODO: Fixup timestamp & seq no.
 
                     let _ = binding.write_stream.write_rtp(&packet).await;
                 }
@@ -578,7 +583,6 @@ impl RtpClient {
 
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut media)?;
-        // TODO: Add seq no & timestamp fixup interceptor
 
         let mut setting_engine = SettingEngine::default();
 
@@ -889,8 +893,10 @@ impl RtpClient {
         trace!("Peer connection closed");
     }
 
-    pub fn create_rtc_source(&mut self, stream_id: &str) -> Option<Pin<Box<dyn RtpSource>>> {
-        let stream = self.receiving_tracks.iter_mut().find(|t| t.stream_id == stream_id);
+    pub fn create_broadcast_source(&mut self, stream_id: &str) -> Option<Pin<Box<dyn RoomBroadcastSource>>> {
+        let stream = self.receiving_tracks
+            .iter_mut()
+            .find(|t| t.stream_id == stream_id);
         let stream = match stream {
             Some(stream) => stream,
             None => return None,
@@ -898,10 +904,10 @@ impl RtpClient {
 
         
         let (events_tx, events_rx) = mpsc::channel(16);
-        let handler = Arc::new(RtpSourceHandler{
+        let handler = Arc::new(ReceivingTrackBroadcastHandler{
             events: events_tx
         });
-        let source = Box::pin(RtpClientTrackSource{
+        let source = Box::pin(ClientBroadcastSource{
             weak_track: Arc::downgrade(stream),
             events: events_rx,
             recv_handler: handler.clone(),
@@ -955,7 +961,7 @@ impl RtpClient {
         Ok(track)
     }
 
-    pub async fn create_rtc_target(&mut self) -> Pin<Box<dyn RtpTarget>> {
+    pub async fn create_broadcast_target(&mut self) -> (String, Pin<Box<dyn RoomBroadcastTarget>>) {
         let track = self.sending_tracks
             .iter()
             .find(|track| track.event_handler.lock().is_none())
@@ -974,7 +980,7 @@ impl RtpClient {
         };
 
         let (events_tx, events_rx) = mpsc::channel(16);
-        let target = RtpClientTarget {
+        let target = ClientBroadcastTarget {
             events: events_rx,
             track: track.clone(),
             weak_client: self.weak_ref.clone(),
@@ -985,7 +991,7 @@ impl RtpClient {
             *handler = Some(events_tx);
         }
 
-        Box::pin(target)
+        (track.id.clone(), Box::pin(target))
     }
 }
 

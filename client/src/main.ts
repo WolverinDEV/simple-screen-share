@@ -1,6 +1,6 @@
 import React from "react";
 import { Root } from "react-dom/client";
-import { RtpServerConnection } from "./backend/rtp-connection/signaling";
+import { SignallingConnection } from "./backend/rtp-connection/signaling";
 import { appStore, initializeAppStore } from "./state";
 import { initializeSession } from "./state/auth";
 import AppView from "./view";

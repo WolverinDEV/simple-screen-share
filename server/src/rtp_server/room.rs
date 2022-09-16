@@ -19,24 +19,28 @@ use super::{
 
 pub type RoomId = u64;
 
-pub enum RtpSourceEvent {
+pub type BroadcastId = u32;
+type SyncMutex<T> = std::sync::Mutex<T>;
+
+
+pub enum BroadcastSourceEvent {
     Media(webrtc::rtp::packet::Packet),
     End,
 }
 
-pub type BroadcastId = u32;
-
 #[derive(Debug)]
-pub enum RtpTargetEvent {
+pub enum BroadcastTargetEvent {
     RequestPli,
 }
 
-type SyncMutex<T> = std::sync::Mutex<T>;
-pub trait RtpSource: Stream<Item = RtpSourceEvent> + Send {
-    fn pli_request(self: Pin<&mut Self>);
+/// Source stream for a client broadcast
+pub trait RoomBroadcastSource: Stream<Item = BroadcastSourceEvent> + Send {
+    fn send_pli(self: Pin<&mut Self>);
 }
 
-pub trait RtpTarget: Stream<Item = RtpTargetEvent> + Send {
+
+/// Target stream for a client broadcast
+pub trait RoomBroadcastTarget: Stream<Item = BroadcastTargetEvent> + Send {
     fn send_rtp(&self, _packet: &mut webrtc::rtp::packet::Packet) {}
 }
 
@@ -48,8 +52,8 @@ struct ClientBroadcast {
     client: Arc<Mutex<SignalingClient>>,
 
     waker: Option<Waker>,
-    source: Pin<Box<dyn RtpSource>>,
-    targets: BTreeMap<ClientId, Pin<Box<dyn RtpTarget>>>,
+    source: Pin<Box<dyn RoomBroadcastSource>>,
+    targets: BTreeMap<ClientId, Pin<Box<dyn RoomBroadcastTarget>>>,
 
     shutdown_tx: Option<oneshot::Sender<()>>,
     shutdown_rx: oneshot::Receiver<()>,
@@ -78,7 +82,7 @@ impl Future for ClientBroadcast {
                 };
 
                 match event {
-                    RtpTargetEvent::RequestPli => pli_request = true,
+                    BroadcastTargetEvent::RequestPli => pli_request = true,
 
                     #[allow(unreachable_patterns)]
                     event => info!("Client {} event: {:#?}", client_id, event),
@@ -90,7 +94,7 @@ impl Future for ClientBroadcast {
 
         if pli_request {
             // TODO: Throttle pli requests so the source does not gets spammed.
-            self.source.as_mut().pli_request();
+            self.source.as_mut().send_pli();
         }
 
         while let Ready(event) = self.source.poll_next_unpin(cx) {
@@ -103,12 +107,12 @@ impl Future for ClientBroadcast {
             };
 
             match event {
-                RtpSourceEvent::Media(mut packet) => {
+                BroadcastSourceEvent::Media(mut packet) => {
                     for client in self.targets.values() {
                         client.send_rtp(&mut packet);
                     }
                 },
-                RtpSourceEvent::End => return Poll::Ready(())
+                BroadcastSourceEvent::End => return Poll::Ready(())
             }
         }
 
@@ -237,7 +241,7 @@ impl Room {
         &mut self,
         client_id: ClientId,
         name: String,
-        source: Pin<Box<dyn RtpSource>>,
+        source: Pin<Box<dyn RoomBroadcastSource>>,
     ) -> S2CResponse {
         let client = match self.clients.get(&client_id) {
             Some(client) => client,
@@ -360,7 +364,7 @@ impl Room {
         &mut self,
         client_id: ClientId,
         broadcast_id: BroadcastId,
-        target: Pin<Box<dyn RtpTarget>>,
+        target: Pin<Box<dyn RoomBroadcastTarget>>,
     ) -> S2CResponse {
         let broadcast = match self.broadcasts.get(&broadcast_id) {
             Some(broadcast) => broadcast,

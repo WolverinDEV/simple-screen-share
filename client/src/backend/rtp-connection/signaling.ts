@@ -1,11 +1,8 @@
-import { C2SMessage, C2SRequest, IceCandidate, S2CMessage, S2CNotify, S2CResponse } from "@sss-definitions/rtp-messages";
+import { C2SMessage, C2SRequest, S2CMessage, S2CNotify, S2CResponse } from "@sss-definitions/rtp-messages";
 import { RtpEvents } from ".";
 import { EventEmitter } from "../../utils/ee2";
-import { Observable } from "../../utils/observable";
-import { VirtualCamera } from "../../utils/virtual-camera";
-import { RemoteStream, RtcConnection, RtpSignalingConnection } from "./rtc";
 
-type ConnectionState = {
+export type SignallingState = {
     status: "unconnected",
 } | {
     status: "connecting",
@@ -25,58 +22,56 @@ type PendingRequest = {
 };
 
 type NotifyPayload<K extends S2CNotify["type"]> = Extract<S2CNotify, { type: K }> extends { payload: infer U } ? U : never;
-type NotifyHandler = {
-    [K in S2CNotify["type"]]?: (payload: NotifyPayload<K>, type: K) => void
+type NotifyHandler<K extends S2CNotify["type"]> = (payload: NotifyPayload<K>, type: K) => void;
+type NotifyHandlers = {
+    [K in S2CNotify["type"]]?: NotifyHandler<K>[]
 };
 
 
 const kRequestErrorConnectionClosed: S2CResponse = { type: "ConnectionClosed" };
 const kRequestErrorRequestTimeout: S2CResponse = { type: "RequestTimeout" };
-export class RtpServerConnection {
-    readonly events: EventEmitter<RtpEvents>;
+export class SignallingConnection {
+    private readonly events: EventEmitter<RtpEvents>;
     private readonly serverUrl: string;
-    private readonly connectToken: string;
-    private readonly rtcConnection: RtcConnection;
 
     private socket: WebSocket | null;
     private requestIdIndex: number;
     private requests: Record<number, PendingRequest>;
-    private notify: NotifyHandler;
+    private notify: NotifyHandlers;
 
-    public state: Observable<ConnectionState>;
+    public state: SignallingState;
     private sessionInitialized: boolean;
 
-    constructor(serverUrl: string, connectToken: string) {
-        this.events = new EventEmitter();
-
+    constructor(events: EventEmitter<RtpEvents>, serverUrl: string) {
+        this.events = events;
         this.serverUrl = serverUrl;
-        this.connectToken = connectToken;
 
-        this.state = new Observable({ status: "unconnected" });
+        this.state = { status: "unconnected" };
         this.requestIdIndex = 0;
         this.socket = null;
         this.requests = {};
         this.notify = {};
+    }
 
-        this.rtcConnection = new RtcConnection(this.events);
+    private updateState(newState: SignallingState) {
+        const oldState = this.state;
+        this.state = newState;
 
-        this.notify["NotifyIceCandidate"] = candidate => this.rtcConnection.applyRemoteIceCandidate(candidate);
-        this.notify["NotifyIceCandidateFinished"] = () => this.rtcConnection.applyRemoteIceCandidate(null);
-        this.notify["NotifyNegotiationOffer"] = async offer => {
-            const answer = await this.rtcConnection.applyNegotiationOffer(offer);
-            this.sendRequest("NegotiationAnswer", { answer });  
-        };
-
-        this.notify["NotifyUsers"] = users => console.info("Users: %o", users);
-        this.notify["NotifyBroadcastStarted"] = broadcast => {
-            console.info("Broadcast started: %o", broadcast);
-            this.sendRequest("BroadcastSubscribe", { broadcast_id: broadcast.broadcast_id });
-        };
+        this.events.emit("signalling.state_changed", newState, oldState);
     }
 
     public connect() {
-        if(this.state.value.status !== "unconnected") {
+        if(this.state.status !== "unconnected") {
             throw new Error("expected unconnected state");
+        }
+
+        this.openSocket();
+        this.updateState({ status: "connecting" });
+    }
+
+    private openSocket() {
+        if(this.socket !== null) {
+            throw new Error("socket already exists");
         }
 
         const socket = this.socket = new WebSocket(this.serverUrl);
@@ -84,7 +79,6 @@ export class RtpServerConnection {
         this.socket.onclose = e => this.socket === socket && this.onSocketClosed(e);
         this.socket.onerror = () => this.socket === socket && this.onSocketError();
         this.socket.onmessage = e => this.socket === socket && this.onSocketMessage(e);
-        this.state.value = { status: "connecting" };
     }
 
     private closeSocket() {
@@ -102,7 +96,7 @@ export class RtpServerConnection {
         this.socket = null;
     }
 
-    private abortRequests() {
+    private abortPendingRequests() {
         for(const requestId of Object.keys(this.requests)) {
             const request = this.requests[parseInt(requestId)];
             delete this.requests[requestId];
@@ -111,7 +105,7 @@ export class RtpServerConnection {
         }
     }
 
-    private async sendRequest<R extends C2SRequest["type"]>(request: R, payload: Omit<C2SRequest & { type: R }, "type">) : Promise<S2CResponse> {
+    public async sendRequest<R extends C2SRequest["type"]>(request: R, payload: Omit<C2SRequest & { type: R }, "type">) : Promise<S2CResponse> {
         if(this.socket?.readyState !== WebSocket.OPEN) {
             return kRequestErrorConnectionClosed;
         }
@@ -143,82 +137,20 @@ export class RtpServerConnection {
         return result;
     }
     
-    private initializeRtcSignalingConnection() {
-        const connection = this;
-        this.rtcConnection.applySignalingConnection(new class implements RtpSignalingConnection {
-            async executeNegotiation() {
-                const offer = await connection.rtcConnection.createLocalOffer();
-                const response = await connection.sendRequest("NegotiationOffer", { offer });
-                if(response.type === "NegotiationOfferSuccess") {
-                    await connection.rtcConnection.applyNegotiationAnswer(response.payload.answer);
-                    console.info("Executed negotiation.");
-                } else {
-                    console.error("Failed to execute negotiation: %o", response);
-                }
-            }
-
-            async signalIceCandidates(candidates: IceCandidate[], finished: boolean): Promise<void> {
-                const response = await connection.sendRequest("IceCandidates", { candidates, finished });
-                if(response.type === "Success") {
-                    return;
-                }
-                
-                console.warn("Failed to signal local ICE candidates: %o", response);
-            }
-
-        });
-    }
-
     private async onSocketConnected() {
-        console.log("Connected. Creating offer and initializing session.");
-        const offer = await this.rtcConnection.createLocalOffer();
-
-        this.sendRequest("InitializeSesstion", {
-            version: 1,
-            token: this.connectToken,
-            offer
-        }).then(async result => {
-            if(result.type !== "SessionInitializeSuccess") {
-                // FIXME: Close/abort connection!
-                console.warn("Invalid initialize session result: %o", result);
-                return;
-            }
-            
-            this.initializeRtcSignalingConnection();
-            await this.rtcConnection.applyNegotiationAnswer(result.payload.answer);
-            console.log("Applied remote description.");
-
-            this.sessionInitialized = true;
-            this.state.value = { status: "connected" };
-            {
-                const vcam = new VirtualCamera(30, { width: 1080, height: 1080, });
-                vcam.start();
-
-                const streamId = await this.rtcConnection.sendTrack(vcam.getMediaStream().getVideoTracks()[0]);
-                console.log("Starting VCam at %s", streamId);
-                await this.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId });
-
-                // await new Promise(resolve => setTimeout(resolve, 1000));
-                // console.log("Starting VCam at %s", streamId);
-                // await this.sendRequest("BroadcastStart", { name: "V-Cam 2", source: streamId });
-
-                // await new Promise(resolve => setTimeout(resolve, 1000));
-                // console.log("Starting VCam at %s", streamId);
-                // await this.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId });
-            }
-        });
+        this.updateState({ status: "connected" });
     }
 
     private onSocketClosed(event: CloseEvent) {
-        this.state.value = { status: "disconnected", reason: event.reason ? `${event.code} / ${event.reason}` : `${event.code ?? 0}` };
         this.closeSocket();
-        this.abortRequests();
+        this.updateState({ status: "disconnected", reason: event.reason ? `${event.code} / ${event.reason}` : `${event.code ?? 0}` });
+        this.abortPendingRequests();
     }
 
     private onSocketError() {
-        this.state.value = { status: "failed", reason: "socket io failure" };
         this.closeSocket();
-        this.abortRequests();
+        this.updateState({ status: "failed", reason: "socket io failure" });
+        this.abortPendingRequests();
     }
 
     private onSocketMessage(event: MessageEvent) {
@@ -258,24 +190,26 @@ export class RtpServerConnection {
                 break;
 
             case "Notify":
-                const handler = this.notify[message.payload.type];
-                if(typeof handler !== "function") {
+                const handlers = this.notify[message.payload.type];
+                if(!Array.isArray(handlers) || handlers.length === 0) {
                     console.warn("Received notify without a handler: %s", message.payload.type);
                     return;
                 }
 
-                // @ts-ignore
-                handler(message.payload.payload, message.payload.type);
+                for(const handler of handlers) {
+                    try {
+                        // @ts-ignore
+                        handler(message.payload.payload, message.payload.type);
+                    } catch(error) {
+                        console.error("Notify handler exception cought: %o", error);
+                    }
+                }
                 break; 
         }
     }
-    
-    public getRemoteStreams() : RemoteStream[] {
-        return this.rtcConnection.getRemoteStreams();
-    }
 
-    public getRemoteStream(streamId: string) : RemoteStream | null {
-        return this.rtcConnection.getRemoteStreams()
-            .find(stream => stream.streamId === streamId) ?? null;
+    public registerNotifyHandler<K extends S2CNotify["type"]>(notify: K, handler: NotifyHandler<K>) {
+        const handlers = this.notify[notify] ?? (this.notify[notify] = []);
+        handlers.push(handler);
     }
 }
