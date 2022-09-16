@@ -3,6 +3,9 @@ import { RtpEvents } from '.';
 import { IceCandidate } from "../../../generated/rtp-messages";
 import { EventEmitter } from '../../utils/ee2';
 
+// Known bugs which need to be detected:
+// - Firefox ice candidate gathering may hangs up (browser restart required).
+//   Detectable via no ice candidate events fires and connection failed.
 console.log("WebRTC adapter browserDetails %o", adapter.browserDetails);
 export interface RtpSignalingConnection {
     executeNegotiation();
@@ -140,11 +143,11 @@ export class RtcConnection {
         };
 
         this.freeLocalVideoStreams = [];
-        for(let index = 0; index < 1; index++) {
+        for(let index = 0; index < 2; index++) {
             const stream = new MediaStream();
             const transceiver = this.peer.addTransceiver("video", {
                 direction: "sendrecv",
-                streams: [ stream ]
+                streams: [ stream ],
             });
             this.freeLocalVideoStreams.push([ stream.id, transceiver.sender ]);
         }
@@ -177,7 +180,7 @@ export class RtcConnection {
      * @returns local sdp offer
      */
     public async createLocalOffer() : Promise<string> {
-        const offer = await this.peer.createOffer();
+        const offer = await this.peer.createOffer({ offerToReceiveVideo: true });
         await this.motifyLocalSdp(offer);
         
         console.groupCollapsed("SDP local offer");

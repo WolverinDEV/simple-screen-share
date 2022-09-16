@@ -498,11 +498,6 @@ impl ClientRequestHandler for ServerClientHandler {
                     rtp_client.create_broadcast_source(&payload.source)
                 };
 
-                let source = match source {
-                    Some(source) => source,
-                    None => return S2CResponse::BroadcastSourceUnknownId,
-                };
-
                 let broadcast_id = {
                     let mut room = room.lock().await;
                     let result = room

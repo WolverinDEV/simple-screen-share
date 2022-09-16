@@ -21,6 +21,9 @@ export class RtpConnection {
     private readonly signallingConnection: SignallingConnection;
     private state: RtpConnectionState;
 
+    private ownClientId: number;
+    private ownUserId: number
+
     constructor(serverUrl: string, connectToken: string) {
         this.events = new EventEmitter();
         this.connectToken = connectToken;
@@ -45,9 +48,12 @@ export class RtpConnection {
         });
 
         this.signallingConnection.registerNotifyHandler("NotifyUsers", users => console.info("Users: %o", users));
-        this.signallingConnection.registerNotifyHandler("NotifyBroadcastStarted", broadcast => {
+        this.signallingConnection.registerNotifyHandler("NotifyBroadcastStarted", async broadcast => {
             console.info("Broadcast started: %o", broadcast);
-            this.signallingConnection.sendRequest("BroadcastSubscribe", { broadcast_id: broadcast.broadcast_id });
+            if(broadcast.client_id !== this.ownClientId) {
+                const response = await this.signallingConnection.sendRequest("BroadcastSubscribe", { broadcast_id: broadcast.broadcast_id });
+                console.log("Subscribe result: %o", response);
+            }
         });
 
         this.events.on("signalling.state_changed", newState => {
@@ -93,10 +99,13 @@ export class RtpConnection {
                 return;
             }
             
+
             this.initializeRtcSignalingConnection();
             await this.rtcConnection.applyNegotiationAnswer(result.payload.answer);
-            console.log("Applied remote description.");
-
+            
+            this.ownUserId = result.payload.own_user_id;
+            this.ownClientId = result.payload.own_client_id;
+            console.debug("Session initialized. Received client id %d (User Id %d)", this.ownClientId, this.ownUserId);
             this.updateState("connected");
             
             // TODO: Remove me: This is debug.

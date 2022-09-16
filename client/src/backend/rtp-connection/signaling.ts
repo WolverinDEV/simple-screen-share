@@ -40,7 +40,6 @@ export class SignallingConnection {
     private notify: NotifyHandlers;
 
     public state: SignallingState;
-    private sessionInitialized: boolean;
 
     constructor(events: EventEmitter<RtpEvents>, serverUrl: string) {
         this.events = events;
