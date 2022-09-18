@@ -186,7 +186,7 @@ pub mod notify {
         NotifyBroadcasts(Vec<BroadcastEntry>),
 
         /// Will be send when a new user joins the room.
-        NotifyUserJoined(ClientId, UserId),
+        NotifyUserJoined(UserEntry),
 
         /// Will be send when a user leaves the room.
         NotifyUserLeft(ClientId),

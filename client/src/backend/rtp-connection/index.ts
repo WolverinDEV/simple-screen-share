@@ -1,6 +1,5 @@
 import { BroadcastEntry, BroadcastKind, IceCandidate } from "../../../generated/rtp-messages";
 import { EventEmitter } from "../../utils/ee2";
-import { VirtualCamera } from "../../utils/virtual-camera";
 import { RemoteStream, RtcConnection, RtpSignalingConnection } from "./rtc";
 import { SignallingConnection, SignallingState } from "./signaling";
 
@@ -11,9 +10,9 @@ export interface RtpEvents {
     "state_changed": [ newState: RtpConnectionState, oldState: RtpConnectionState ],
 
 
-    "user.received": void,
-    "user.joined": void,
-    "user.left": void,
+    "client.received": void,
+    "client.joined": Client,
+    "client.left": Client,
 
 
     // All broadcasts have been received.
@@ -21,12 +20,14 @@ export interface RtpEvents {
     // A new broadcast has been created.
     "broadcast.created": [broadcast: Broadcast],
     "broadcast.ended": [broadcast: Broadcast],
+
+    "rtc.connection_state_changed": [ newState: RTCPeerConnectionState, oldState: RTCPeerConnectionState ], 
+    "rtc.signaling_state_changed": [ newState: RTCSignalingState, oldState: RTCSignalingState ],
+    "rtc.ice_connection_state_changed": [ newState: RTCIceConnectionState, oldState: RTCIceConnectionState ],
+    "rtc.ice_gathering_state_changed": [ newState: RTCIceGathererState, oldState: RTCIceGathererState ],
 }
 
-type RtpConnectionState = "disconnected" | "connecting" | "initializing" | "connected";
-
 export class Broadcast {
-    // TODO: Type is it video or audio.
     public readonly broadcastId: number;
     public readonly name: string;
     public readonly clientId: number;
@@ -43,6 +44,17 @@ export class Broadcast {
     }
 }
 
+export class Client {
+    public readonly clientId: number;
+    public readonly userId: number;
+
+    constructor(clientId: number, userId: number) {
+        this.clientId = clientId;
+        this.userId = userId;
+    }
+}
+
+export type RtpConnectionState = "new" | "connecting" | "initializing" | "connected" | "failed" | "closed";
 export class RtpConnection {
     readonly events: EventEmitter<RtpEvents>;
     
@@ -55,6 +67,7 @@ export class RtpConnection {
     private ownUserId: number
 
     private broadcasts: Broadcast[];
+    private users: Client[];
 
     constructor(serverUrl: string, connectToken: string) {
         this.events = new EventEmitter();
@@ -63,21 +76,69 @@ export class RtpConnection {
         this.signallingConnection = new SignallingConnection(this.events, serverUrl);
         this.rtcConnection = new RtcConnection(this.events);
 
-        this.state = "disconnected";
+        this.state = "new";
         this.broadcasts = [];
-
-        this.events.on("signalling.state_changed", newState => {
-            if(newState.status === "connected") {
-                this.onSignallingConnected();
-            }
-        });
+        this.users = [];
 
         this.signallingConnection.registerNotifyHandler("NotifyIceCandidate", candidate => this.rtcConnection.applyRemoteIceCandidate(candidate));
-        this.signallingConnection.registerNotifyHandler("NotifyIceCandidateFinished", candidate => this.rtcConnection.applyRemoteIceCandidate(null));
+        this.signallingConnection.registerNotifyHandler("NotifyIceCandidateFinished", () => this.rtcConnection.applyRemoteIceCandidate(null));
         
         this.signallingConnection.registerNotifyHandler("NotifyNegotiationOffer", async offer => {
             const answer = await this.rtcConnection.applyNegotiationOffer(offer);
             this.signallingConnection.sendRequest("NegotiationAnswer", { answer });  
+        });
+
+        this.events.on("signalling.state_changed", newState => {
+            if(this.state === "failed" || this.state === "closed") {
+                return;
+            }
+
+            switch(newState.status) {
+                case "connecting":
+                    break;
+
+                case "connected":
+                    this.onSignallingConnected();
+                    break;
+
+                case "disconnected":
+                    this.setConnectionFailed("signalling", `connection closed unexpectitly: ${newState.reason}`);
+                    break;
+
+                case "failed":
+                    this.setConnectionFailed("signalling", `fatal error: ${newState.reason}`);
+                    break;
+            }
+        });
+
+        this.events.on("rtc.connection_state_changed", newState => {
+            switch(newState) {
+                case "closed":
+                case "failed":
+                    switch(this.state) {
+                        case "failed":
+                        case "closed":
+                            break;
+
+                        default:
+                            this.setConnectionFailed("rtc", "rtc connection closed unexpectitly");
+                            break;
+                    }
+
+                case "disconnected":
+                    /* TODO: Timeout if no reconnect happens? */
+                    break;
+
+                case "connecting":
+                case "connected":
+                    /* nice */
+                    break;
+
+                case "new":
+                default:
+                    /* That's pretty odd... */
+                    break;
+            }
         });
 
         this.signallingConnection.registerNotifyHandler("NotifyBroadcasts", broadcasts => {
@@ -91,33 +152,50 @@ export class RtpConnection {
         this.signallingConnection.registerNotifyHandler("NotifyBroadcastStarted", async broadcastInfo => {
             const broadcast = new Broadcast(broadcastInfo);
             this.broadcasts.push(broadcast);
-
-            this.broadcasts.push(broadcast);
             this.events.emit("broadcast.created", broadcast);
         });
 
-        this.events.on("signalling.state_changed", newState => {
-            switch(newState.status) {
-                case "disconnected":
-                case "failed":
-                    if(this.state !== "disconnected") {
-                        // TODO: Shutdown everything.
-                        this.updateState("disconnected");
-                    }
+        this.signallingConnection.registerNotifyHandler("NotifyUsers", clients => {
+            for(const clientInfo of clients) {
+                const client = new Client(clientInfo.client_id, clientInfo.user_id);
+                this.users.push(client);
             }
+
+            this.events.emit("client.received");
         });
 
-        // Currently debugging stuff
-        {
-            this.events.on("broadcast.created", broadcast => {
-                this.subscribeBroadcast(broadcast.broadcastId);
-            });
-            this.events.on("broadcast.received", () => {
-                for(const broadcast of this.broadcasts) {
-                    this.subscribeBroadcast(broadcast.broadcastId);
-                }
-            });
+        this.signallingConnection.registerNotifyHandler("NotifyUserJoined", userInfo => {
+            const client = new Client(userInfo.client_id, userInfo.user_id);
+            this.users.push(client);
+            this.events.emit("client.joined", client);
+        });
+
+        this.signallingConnection.registerNotifyHandler("NotifyUserLeft", clientId => {
+            const clientIndex = this.users.findIndex(client => client.clientId === clientId);
+            if(clientIndex === -1) {
+                /* This is petty odd.. */
+                return;
+            }
+
+            const [ client ] = this.users.splice(clientIndex, 1);
+            this.events.emit("client.left", client);
+        });
+    }
+
+    // Close the connection and free all resources.
+    public close() {
+        if(this.state === "closed") {
+            return;
         }
+
+        this.updateState("closed");
+        this.doClose();
+    }
+
+    // Frees all resources but does not update the connection state.
+    private doClose() {
+        this.rtcConnection.close();
+        this.signallingConnection.close();
     }
 
     public getState() : RtpConnectionState {
@@ -134,6 +212,11 @@ export class RtpConnection {
         this.events.emit("state_changed", newState, oldState);
     }
 
+    private setConnectionFailed(_module: string, _reason: string) {
+        this.updateState("failed");
+        this.doClose();
+    }
+
     private async onSignallingConnected() {
         this.updateState("initializing");
 
@@ -146,9 +229,8 @@ export class RtpConnection {
             offer
         }).then(async result => {
             if(result.type !== "SessionInitializeSuccess") {
-                // FIXME: Close/abort connection!
                 console.warn("Invalid initialize session result: %o", result);
-                this.updateState("disconnected");;
+                this.setConnectionFailed("session-initialize", result.type);
                 return;
             }
             
@@ -160,58 +242,6 @@ export class RtpConnection {
             this.ownClientId = result.payload.own_client_id;
             console.debug("Session initialized. Received client id %d (User Id %d)", this.ownClientId, this.ownUserId);
             this.updateState("connected");
-            
-            // TODO: Remove me: This is debug.
-            {
-                // {
-                //     const vcam = new VirtualCamera(30, { width: 1080, height: 1080, });
-                //     vcam.start();
-
-                //     const streamId = await this.rtcConnection.sendTrack(vcam.getMediaStream().getVideoTracks()[0]);
-                //     const result = await this.signallingConnection.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId, kind: "Video" });
-                //     console.log("V-Cam start result: %o (%s)", result, streamId);
-                // }
-
-                
-                navigator.mediaDevices
-                    .getUserMedia({ 
-                        audio: {
-                            deviceId: {
-                                exact: "0c82b236ca3b62e137a4cd00ba7c8edd1aa4fc6ca9fb684bb1a556608f92f632x"
-                            },
-                            echoCancellation: {
-                                exact: false
-                            },
-                        },
-                        video: {
-                            // "OBS-Camera" 05fff4c0016c994e756de288520758f63a7395d59be11d92d0a547e0dd37ae71
-                            // "OBS Virtual Camera" 6418c3c2d86d10a351f0a9652b9fb6e5621136f62e188a04bde20d2bac6ab9b3
-                            deviceId: {
-                                exact: "6418c3c2d86d10a351f0a9652b9fb6e5621136f62e188a04bde20d2bac6ab9b3"
-                            }
-                        },
-                    })
-                    .then(async stream => {
-                        const [ audioTrack ] = stream.getAudioTracks();
-                        if(audioTrack) {
-                            console.log("Got audio track. Sending it.");
-                            const streamId = await this.rtcConnection.sendTrack(audioTrack);
-                            const result = await this.signallingConnection.sendRequest("BroadcastStart", { name: "mic", source: streamId, kind: "Audio" });
-                            console.log("Audio start result: %o (%s)", result, streamId);
-                        }
-                        
-                        const [ videoTrack ] = stream.getVideoTracks();
-                        if(videoTrack) {
-                            console.log("Got video track. Sending it.");
-                            const streamId = await this.rtcConnection.sendTrack(videoTrack);
-                            const result = await this.signallingConnection.sendRequest("BroadcastStart", { name: "vid", source: streamId, kind: "Video" });
-                            console.log("Video start result: %o (%s)", result, streamId);
-                        }
-                    })
-                    .catch(error => {
-                        console.error(error);
-                    })
-            }
         });
     }
 
@@ -300,12 +330,28 @@ export class RtpConnection {
         }
     }
 
+    public getClients() : Client[] {
+        return this.users;
+    }
+
+    public getClient(clientId: number) : Client | null {
+        return this.users.find(client => client.clientId === clientId);
+    }
+
     public connect() {
-        if(this.state !== "disconnected") {
-            throw new Error("already connected");
+        if(this.state !== "new") {
+            throw new Error("connect already called");
         }
 
         this.updateState("connecting");
         this.signallingConnection.connect();
+    }
+
+    public getRtcConnection() {
+        return this.rtcConnection;
+    }
+
+    public getSignalingConnection() {
+        return this.signallingConnection;
     }
 }

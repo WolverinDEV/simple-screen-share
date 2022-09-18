@@ -5,7 +5,7 @@ import { useQuery } from "react-query";
 import { Navigate, Route, Routes, useParams } from "react-router";
 import { ResponseRoomJoin } from "../../../../generated/rest-types";
 import { axiosClient } from "../../../backend/axios";
-import { RtpConnection } from "../../../backend/rtp-connection";
+import { RtpConnection, RtpEvents } from "../../../backend/rtp-connection";
 import { RemoteStream } from "../../../backend/rtp-connection/rtc";
 import { extractErrorMessage } from "../../../utils/error";
 import { useForceUpdate } from "../../hooks/force-render";
@@ -102,10 +102,78 @@ const JoinedRoom = React.memo((props: { token: string, serverUrl: string }) => {
         connection.connect();
         // @ts-ignore
         window.connection = connection;
+        
+        connection.events.on("state_changed", async newState => {
+            if(newState === "connected") {
+                // {
+                //     const vcam = new VirtualCamera(30, { width: 1080, height: 1080, });
+                //     vcam.start();
+
+                //     const streamId = await this.rtcConnection.sendTrack(vcam.getMediaStream().getVideoTracks()[0]);
+                //     const result = await this.signallingConnection.sendRequest("BroadcastStart", { name: "V-Cam", source: streamId, kind: "Video" });
+                //     console.log("V-Cam start result: %o (%s)", result, streamId);
+                // }
+
+                
+                navigator.mediaDevices
+                    .getUserMedia({ 
+                        audio: {
+                            deviceId: {
+                                exact: "0c82b236ca3b62e137a4cd00ba7c8edd1aa4fc6ca9fb684bb1a556608f92f632x"
+                            },
+                            echoCancellation: {
+                                exact: false
+                            },
+                        },
+                        video: {
+                            // "OBS-Camera" 05fff4c0016c994e756de288520758f63a7395d59be11d92d0a547e0dd37ae71
+                            // "OBS Virtual Camera" 6418c3c2d86d10a351f0a9652b9fb6e5621136f62e188a04bde20d2bac6ab9b3
+                            deviceId: {
+                                exact: "6418c3c2d86d10a351f0a9652b9fb6e5621136f62e188a04bde20d2bac6ab9b3"
+                            }
+                        },
+                    })
+                    .then(async stream => {
+                        const [ audioTrack ] = stream.getAudioTracks();
+                        if(audioTrack) {
+                            console.log("Got audio track. Sending it.");
+                            const streamId = await connection.getRtcConnection().sendTrack(audioTrack);
+                            const result = await connection.getSignalingConnection().sendRequest("BroadcastStart", { name: "mic", source: streamId, kind: "Audio" });
+                            console.log("Audio start result: %o (%s)", result, streamId);
+                        }
+                        
+                        const [ videoTrack ] = stream.getVideoTracks();
+                        if(videoTrack) {
+                            console.log("Got video track. Sending it.");
+                            const streamId = await connection.getRtcConnection().sendTrack(videoTrack);
+                            const result = await connection.getSignalingConnection().sendRequest("BroadcastStart", { name: "vid", source: streamId, kind: "Video" });
+                            console.log("Video start result: %o (%s)", result, streamId);
+                        }
+                    })
+                    .catch(error => {
+                        console.error(error);
+                    })
+            }
+        })
+
+        // Currently debugging stuff
+        {
+            connection.events.on("broadcast.created", broadcast => {
+                connection.subscribeBroadcast(broadcast.broadcastId);
+            });
+            connection.events.on("broadcast.received", () => {
+                for(const broadcast of connection.getBroadcasts()) {
+                    connection.subscribeBroadcast(broadcast.broadcastId);
+                }
+            });
+        }
 
         return connection;
     }, [ props.token, props.serverUrl ]);
 
+    const stateHistory = useMemo(() => new RtcStateHistory(connection), [ connection ]);
+    console.log(stateHistory);
+    
     return (
         <ContextRtpConnection.Provider value={connection}>
             <ConnectionConnecting />
@@ -136,7 +204,7 @@ const ConnectionConnecting = React.memo(() => {
 
 const ConnectionDisconnected = React.memo(() => {
     const state = useConnectionState();
-    if(state !== "disconnected") {
+    if(state !== "closed" && state !== "failed") {
         return null;
     }
 
@@ -289,3 +357,46 @@ const RemoteStreamRenderer = React.memo((props: {
             return <Typography>Unknown stream type {stream.type}</Typography>;
     }
 });
+
+interface StateTypeMapping {
+    "ice-connection": RTCIceConnectionState,
+    "ice-gathering": RTCIceGatheringState,
+    "peer-connection": RTCPeerConnectionState,
+    "peer-signaling": RTCSignalingState,
+};
+
+type StateType = keyof StateTypeMapping;
+type StateChangeEntry<T extends StateType> = {
+    type: T,
+    timestamp: number,
+
+    oldState: StateTypeMapping[T],
+    newState: StateTypeMapping[T],
+};
+
+class RtcStateHistory {
+    readonly connection: RtpConnection;
+    readonly changes: StateChangeEntry<StateType>[]; 
+
+    constructor(connection: RtpConnection) {
+        this.connection = connection;
+
+        this.changes = [];
+        this.bindChangeHandler("rtc.connection_state_changed", "peer-connection");
+        this.bindChangeHandler("rtc.signaling_state_changed", "peer-signaling");
+        this.bindChangeHandler("rtc.ice_connection_state_changed", "ice-connection");
+        this.bindChangeHandler("rtc.ice_gathering_state_changed", "ice-gathering");
+    }
+
+    private bindChangeHandler<T extends keyof RtpEvents, R extends StateType>(event: T, type: R) {
+        this.connection.events.on(event as any, (newState: any, oldState: any) => {
+            this.changes.push({
+                type,
+                timestamp: Date.now(),
+
+                newState,
+                oldState
+            });
+        });
+    }
+}

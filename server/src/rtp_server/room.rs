@@ -7,7 +7,7 @@ use std::{
 
 use crate::rest_controller::auth::UserId;
 use futures::{future, future::FutureExt, Future, StreamExt};
-use log::{info, trace};
+use log::{info};
 use rand::{thread_rng, Rng};
 use rocket::tokio::{sync::{Mutex, oneshot}, task};
 use serde::{Serialize, Deserialize};
@@ -16,7 +16,7 @@ use typescript_type_def::TypeDef;
 
 use super::{
     client::{ClientId, SignalingClient},
-    messages::{notify::{self, BroadcastEntry}, response::S2CResponse},
+    messages::{notify::{self, BroadcastEntry, UserEntry}, response::S2CResponse},
 };
 
 pub type RoomId = u64;
@@ -185,7 +185,7 @@ impl Room {
 
             let mut other_client = other_client.lock().await;
             other_client
-                .send_message(&notify::S2CNotify::NotifyUserJoined(client_id, user_id).into());
+                .send_message(&notify::S2CNotify::NotifyUserJoined(UserEntry{ client_id, user_id }).into());
         }
 
         {

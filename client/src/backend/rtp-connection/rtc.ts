@@ -8,28 +8,19 @@ import { compressSdp } from './sdp';
 // - Firefox ice candidate gathering may hangs up (browser restart required).
 //   Detectable via no ice candidate events fires and connection failed.
 console.log("WebRTC adapter browserDetails %o", adapter.browserDetails);
+
+interface EventIceCandidateError extends Event {
+    address: string,
+    errorCode: number,
+    errorText: string,
+    port: number,
+    url: string
+}
+
 export interface RtpSignalingConnection {
     executeNegotiation();
 
     signalIceCandidates(candidates: IceCandidate[], finished: boolean) : Promise<void>;
-}
-
-export class RemoteTrack {
-    private readonly id: string;
-    private readonly track: MediaStreamTrack;
-
-    constructor(id: string, track: MediaStreamTrack) {
-        this.id = id;
-        this.track = track;
-    }
-
-    public getMediaTrack() : MediaStreamTrack {
-        return this.track;
-    }
-}
-
-export class LocalTrack {
-    private readonly id: string;
 }
 
 type StreamType = "audio" | "video";
@@ -70,6 +61,10 @@ class LocalStream {
     }
 
     public removeTrack() {
+        if(this.sender.transport.state === "closed") {
+            return;
+        }
+        
         this.sender.replaceTrack(null);
     }
 }
@@ -87,6 +82,11 @@ export class RtcConnection {
 
     private localStreams: LocalStream[];
     private remoteStreams: RemoteStream[];
+
+    private lastConnectionState: RTCPeerConnectionState;
+    private lastSignallingState: RTCSignalingState;
+    private lastIceConnectionState: RTCIceConnectionState;
+    private lastIceGatheringState: RTCIceGathererState;
    
     constructor(events: EventEmitter<RtpEvents>) {
         this.events = events;
@@ -98,32 +98,34 @@ export class RtcConnection {
         this.remoteIceCandidatesFinished = false;
         this.cachedRemoteIceCandidates = [];
 
+        this.localStreams = [];
         this.remoteStreams = [];
 
         this.peer = new RTCPeerConnection({
             iceServers: [{
                 urls: 'stun:stun.l.google.com:19302'
             }],
-
-            rtcpMuxPolicy: "require",
-            bundlePolicy: "balanced"
         });
 
         // @ts-ignore
         window.peer = this.peer;
 
-        
-        this.peer.oniceconnectionstatechange = () => console.log("ICE connection state changed to %s", this.peer.iceConnectionState);
-        this.peer.onsignalingstatechange = () => console.log("Signalling state changed to %s", this.peer.signalingState);
-        this.peer.onconnectionstatechange = () => console.log("Connection state changed to %s", this.peer.connectionState);
-
-        this.peer.onicegatheringstatechange = () => {
-            console.log("ICE gathering state changed to %s", this.peer.iceGatheringState);
-            if(this.peer.iceGatheringState === "complete") {
-                this.onLocalIceFinished();
-            }
+        this.peer.onsignalingstatechange = () => {
+            this.events.emit("rtc.signaling_state_changed", this.peer.signalingState, this.lastSignallingState);
+            this.lastSignallingState = this.peer.signalingState;
         };
-        
+        this.peer.onconnectionstatechange = () => {
+            this.events.emit("rtc.connection_state_changed", this.peer.connectionState, this.lastConnectionState);
+            this.lastConnectionState = this.peer.connectionState;
+        };
+        this.peer.oniceconnectionstatechange = () => {
+            this.events.emit("rtc.ice_connection_state_changed", this.peer.iceConnectionState, this.lastIceConnectionState);
+            this.lastIceConnectionState = this.peer.iceConnectionState;
+        };
+        this.peer.onicegatheringstatechange = () => {
+            this.events.emit("rtc.ice_gathering_state_changed", this.peer.iceGatheringState, this.lastIceGatheringState);
+            this.lastIceGatheringState = this.peer.iceGatheringState;
+        };
         this.peer.onicecandidate = event => {
             if(!event.candidate || !event.candidate.candidate) {
                 this.onLocalIceFinished();
@@ -140,15 +142,35 @@ export class RtcConnection {
                 ufrag: candidate.usernameFragment ?? ""
             });
         };
-        // FIXME: Handle!
-        this.peer.onicecandidateerror = () => console.log("ICE candidates error.");
+        
+        this.peer.onicecandidateerror = (event: EventIceCandidateError) => {
+            if(adapter.browserDetails.browser === "firefox") {
+                /*
+                 * Firefox does not provides any information about which ICE candidate fails.
+                 * Bug: https://bugzilla.mozilla.org/show_bug.cgi?id=1561441
+                 */
+                return;
+            }
+
+
+            console.log("ICE candidate error: %o", {
+                address: event.address,
+                errorCode: event.errorCode,
+                errorText: event.errorText,
+                port: event.port,
+                url: event.url
+            });
+
+            // TODO: How to propergate this error/some special handling?
+        };
         this.peer.onnegotiationneeded = () => this.signalingConnection?.executeNegotiation();
         this.peer.ontrack = event => {
             // Track names are contained in the stream ids.
             if(event.streams.length !== 1) {
-                console.log(event.receiver);
-                console.log(event.track);
-                console.log(event.transceiver);
+                /*
+                 * This might happen when we offer to receive video/audio but the server does not send any video/audio streams.
+                 * The client will still create tracks for that but without any stream ids.
+                 */
                 console.warn(`Received not unique identifyable ${event.track.kind} track (contained in ${event.streams.length} streams).`);
                 return;
             }
@@ -170,11 +192,38 @@ export class RtcConnection {
             console.log("Received track %s %s", event.track.kind, trackId);
         };
 
-        this.localStreams = [];
+        this.lastConnectionState = this.peer.connectionState;
+        this.lastSignallingState = this.peer.signalingState;
+        this.lastIceConnectionState = this.peer.iceConnectionState;
+        this.lastIceGatheringState = this.peer.iceGatheringState;
+
+        this.events.on("rtc.ice_gathering_state_changed", newState => {
+            if(newState === "complete") {
+                /*
+                 * Not all implementations fire an ice candidate with "undefined" description
+                 * to indicate that gathering has been completed. 
+                 */
+                this.onLocalIceFinished();
+            }
+        });
+
+        this.preallocateLocalStreams();
+    }
+
+    private preallocateLocalStreams() {
         for(let index = 0; index < 2; index++) {
             this.allocateLocalStream("video");
             this.allocateLocalStream("audio");
         }
+    }
+
+    public close() {
+        this.peer.close();
+        for(const localStream of this.localStreams) {
+            localStream.removeTrack();
+        }
+        this.localStreams.splice(0, this.localStreams.length);
+        this.remoteStreams.splice(0, this.remoteStreams.length);
     }
 
     private allocateLocalStream(type: StreamType) : LocalStream {
@@ -334,7 +383,6 @@ export class RtcConnection {
     
     private async onLocalIceCandidate(candidate: IceCandidate) {
         if(this.signalingConnection) {
-            // TODO: Debounce candidate messages
             await this.signalingConnection.signalIceCandidates([ candidate ], false);
         } else {
             this.cachedLocalIceCandidates.push(candidate);
@@ -383,5 +431,21 @@ export class RtcConnection {
 
     public getRemoteStreams() : RemoteStream[] {
         return this.remoteStreams;
+    }
+
+    public getSignalingState() : RTCSignalingState {
+        return this.peer.signalingState;
+    }
+
+    public getIceConnectionState() : RTCIceConnectionState {
+        return this.peer.iceConnectionState;
+    }
+
+    public getIceGatheringState() : RTCIceGatheringState {
+        return this.peer.iceGatheringState;
+    }
+
+    public getConnectionState() {
+        return this.peer.connectionState;
     }
 }

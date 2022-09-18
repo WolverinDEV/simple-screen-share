@@ -37,7 +37,7 @@ use webrtc::{
         receiver_report::ReceiverReport,
         transport_feedbacks::{
             transport_layer_cc::TransportLayerCc, transport_layer_nack::TransportLayerNack,
-        }, sender_report::SenderReport, source_description::SourceDescription,
+        }, sender_report::SenderReport, source_description::SourceDescription, goodbye::Goodbye,
     },
     rtp_transceiver::{
         rtp_codec::{
@@ -127,6 +127,11 @@ impl ReceivingTrackHandler for ReceivingTrackBroadcastHandler {
 
         } else if let Some(_sd) = packet.as_any().downcast_ref::<SourceDescription>() {
 
+        } else if let Some(gb) =  packet.as_any().downcast_ref::<Goodbye>() {
+            let current_src = self.ssrc.load(Ordering::Relaxed);
+            if gb.sources.contains(&current_src) {
+                let _ = self.events.send(BroadcastSourceEvent::End).await;
+            }
         } else {
             trace!("Having RTCP {:#}.", packet);
         }

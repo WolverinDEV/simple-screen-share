@@ -68,6 +68,11 @@ export class SignallingConnection {
         this.updateState({ status: "connecting" });
     }
 
+    public close() {
+        this.closeSocket();
+        this.updateState({ status: "unconnected" });
+    }
+
     private openSocket() {
         if(this.socket !== null) {
             throw new Error("socket already exists");
@@ -141,14 +146,14 @@ export class SignallingConnection {
     }
 
     private onSocketClosed(event: CloseEvent) {
-        this.closeSocket();
         this.updateState({ status: "disconnected", reason: event.reason ? `${event.code} / ${event.reason}` : `${event.code ?? 0}` });
+        this.closeSocket();
         this.abortPendingRequests();
     }
 
     private onSocketError() {
-        this.closeSocket();
         this.updateState({ status: "failed", reason: "socket io failure" });
+        this.closeSocket();
         this.abortPendingRequests();
     }
 
